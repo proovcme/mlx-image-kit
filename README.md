@@ -19,11 +19,14 @@ Type a prompt to generate an image. For example:
 MLX IMAGE
 Qwen-Image 2.1 · 4-bit
 1152x768 | 20 steps | seed random | guidance 1.0
+Type a prompt, or /paste for multiline. /help for commands.
 > A red ceramic teapot on a wooden table, soft window light
 Generating 1152x768 | 20 steps | seed 1977 | guidance 1.0
 ...
 Saved: outputs/YYYYMMDD_HHMMSS.png
 ```
+
+For a prompt with multiple paragraphs, enter `/paste`, paste all lines (including blank lines), then enter `/end` on its own line to generate. Enter `/cancel` instead to discard the prompt without generating.
 
 The seed and timestamp shown above illustrate the output format; an actual run chooses a random seed by default. Images go to `./outputs/` with timestamp names and a numeric suffix on collisions. Filenames never derive from prompts. Completed interactive and batch jobs are recorded privately in `./.history/history.jsonl` for `/repeat`; this folder is ignored by Git in this repository.
 
@@ -40,6 +43,9 @@ The seed and timestamp shown above illustrate the output format; an actual run c
 | `/last`, `/history` | Show completed job details without printing prompts |
 | `/repeat` | Repeat the last prompt with exactly the same seed and settings |
 | `/open` | Open the last PNG with macOS `open` |
+| `/paste` | Start entering a multiline prompt, preserving blank lines |
+| `/end` | Finish a multiline prompt and generate one image |
+| `/cancel` | Discard a multiline prompt without generating |
 | `/help`, `/quit` | Show commands or exit |
 
 Defaults are 1152x768, 20 steps, guidance 1.0, and a random seed. The actual seed is shown before generation and saved in local history. Use `mlx-image --model-path PATH` to select an existing model snapshot.

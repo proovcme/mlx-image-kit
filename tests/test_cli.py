@@ -115,6 +115,78 @@ class HistoryTests(unittest.TestCase):
 
 
 class InteractiveTests(unittest.TestCase):
+    def test_paste_preserves_full_multiline_prompt_until_end(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            generated = []
+            lines = [
+                "A red ceramic teapot on a wooden table.",
+                "",
+                "  A small wooden cabin beside a mountain lake.",
+                "",
+                "A lighthouse during a storm.",
+                "",
+            ]
+            expected = "\n".join(lines)
+
+            def runner(jobs, *, model_path=None, on_complete=None):
+                generated.extend(jobs)
+                result = Result(jobs[0], "2026-09-24T12:00:00+03:00", 1.0, 4.2)
+                if on_complete:
+                    on_complete(result)
+                return Summary(1, completed=[result], elapsed_seconds=1.0)
+
+            entries = iter(["/paste", *lines, "/end", "/quit"])
+
+            def read_input(prompt):
+                entry = next(entries)
+                if entry == "/end":
+                    self.assertEqual(generated, [])
+                return entry
+
+            session = InteractiveSession(
+                output_dir=root / "outputs",
+                history=History(root / ".history" / "history.jsonl"),
+                runner=runner,
+            )
+            with patch("builtins.input", side_effect=read_input), contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(session.run(), 0)
+
+            self.assertEqual(len(generated), 1)
+            self.assertEqual(generated[0].prompt, expected)
+            self.assertEqual(session.history.read()[0]["prompt"], expected)
+            self.assertIn("Type a prompt, or /paste for multiline. /help for commands.", output.getvalue())
+            self.assertIn("Paste multiline prompt. Finish with /end. Cancel with /cancel.", output.getvalue())
+
+    def test_cancel_discards_paste_and_short_prompt_still_generates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            generated = []
+
+            def runner(jobs, *, model_path=None, on_complete=None):
+                generated.extend(jobs)
+                result = Result(jobs[0], "2026-09-24T12:00:00+03:00", 1.0, 4.2)
+                if on_complete:
+                    on_complete(result)
+                return Summary(1, completed=[result], elapsed_seconds=1.0)
+
+            session = InteractiveSession(
+                output_dir=root / "outputs",
+                history=History(root / ".history" / "history.jsonl"),
+                runner=runner,
+            )
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                for line in ("/paste", "A lighthouse during a storm.", "", "/cancel"):
+                    self.assertTrue(session.handle(line))
+                self.assertEqual(generated, [])
+                self.assertTrue(session.handle(PROMPT))
+                self.assertTrue(session.handle("/help"))
+
+            self.assertEqual(len(generated), 1)
+            self.assertEqual(generated[0].prompt, PROMPT)
+            self.assertEqual(len(session.history.read()), 1)
+            self.assertIn("/paste /end /cancel", output.getvalue())
+
     def test_commands_repeat_last_history_and_open_without_gui(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

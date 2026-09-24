@@ -158,6 +158,7 @@ class InteractiveSession:
         self.runner = runner or _run_jobs
         self.opener = opener
         self.reserved: set[Path] = set()
+        self._paste_lines: list[str] | None = None
 
     def status(self) -> None:
         s = self.settings
@@ -209,6 +210,20 @@ class InteractiveSession:
         return summary
 
     def handle(self, line: str) -> bool:
+        if self._paste_lines is not None:
+            if line == "/cancel":
+                self._paste_lines = None
+                print("Multiline prompt cancelled")
+            elif line == "/end":
+                prompt = "\n".join(self._paste_lines)
+                self._paste_lines = None
+                if prompt.strip():
+                    self.generate(prompt)
+                else:
+                    print("Empty prompt; nothing generated")
+            else:
+                self._paste_lines.append(line)
+            return True
         line = line.strip()
         if not line:
             return True
@@ -264,9 +279,15 @@ class InteractiveSession:
                     self.opener(["open", record["output"]], check=False)
                 else:
                     print("No completed PNG to open")
+            elif name == "paste" and not argument:
+                self._paste_lines = []
+                print("Paste multiline prompt. Finish with /end. Cancel with /cancel.")
+            elif name in ("end", "cancel") and not argument:
+                print("No multiline prompt in progress")
             elif name == "help" and not argument:
                 print("/portrait /landscape /square /size WIDTHxHEIGHT /steps N /seed N|random /guidance X")
-                print("/status /last /repeat /history /open /help /quit")
+                print("/status /last /repeat /history /open /paste /end /cancel /help /quit")
+                print("/paste starts multiline input; /end generates; /cancel discards it")
             elif name == "quit" and not argument:
                 return False
             else:
@@ -279,7 +300,7 @@ class InteractiveSession:
         print("MLX IMAGE")
         print("Qwen-Image 2.1 · 4-bit")
         self.status()
-        print("Type a prompt or /help")
+        print("Type a prompt, or /paste for multiline. /help for commands.")
         while True:
             try:
                 line = input("> ")
@@ -287,7 +308,11 @@ class InteractiveSession:
                 print()
                 return 0
             except KeyboardInterrupt:
-                print("\nInput cancelled")
+                if self._paste_lines is not None:
+                    self._paste_lines = None
+                    print("\nMultiline prompt cancelled")
+                else:
+                    print("\nInput cancelled")
                 continue
             if not self.handle(line):
                 return 0
