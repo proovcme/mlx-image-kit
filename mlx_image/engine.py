@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gc
 import os
+import sys
 import tempfile
 import time
 import uuid
@@ -155,7 +156,7 @@ def _load_vae(snapshot: Path):
     return vae
 
 
-def _denoise(job: Job, tr, embeds, mask, model_config: ModelConfig):
+def _denoise(job: Job, tr, embeds, mask, model_config: ModelConfig, on_step: Callable[[int, int], None] | None = None):
     config = Config(
         width=job.width,
         height=job.height,
@@ -178,7 +179,7 @@ def _denoise(job: Job, tr, embeds, mask, model_config: ModelConfig):
         ),
     ).astype(ModelConfig.precision)
     mx.eval(latents)
-    for t in config.time_steps:
+    for step, t in enumerate(config.time_steps, 1):
         latents_scaled = config.scheduler.scale_model_input(latents, t)
         noise = tr(
             t=t,
@@ -189,6 +190,8 @@ def _denoise(job: Job, tr, embeds, mask, model_config: ModelConfig):
         )
         latents = config.scheduler.step(noise=noise, timestep=t, latents=latents)
         mx.eval(latents)
+        if on_step:
+            on_step(step, job.steps)
     return latents
 
 
@@ -244,14 +247,16 @@ def run_jobs(
 
             stage = "text encoder"
             if progress:
-                print("Loading text encoder once...")
+                print("Loading text encoder...")
             te = _load_text_encoder(snapshot)
             qwen = QwenImage21.__new__(QwenImage21)
             super(QwenImage21, qwen).__init__()
             Qwen21Initializer._init_config(qwen, model_config)
             Qwen21Initializer._init_tokenizers(qwen, str(snapshot))
+            if progress:
+                print("Encoding prompt..." if len(states) == 1 else "Encoding prompts...")
             try:
-                for state in states:
+                for position, state in enumerate(states, 1):
                     embeds = mask = None
                     try:
                         began = time.monotonic()
@@ -264,6 +269,8 @@ def run_jobs(
                         mx.eval(embeds, mask)
                         mx.savez(str(state.embeds_path), embeds=embeds, mask=mask)
                         state.compute_seconds += time.monotonic() - began
+                        if progress:
+                            print(f"  {position}/{len(states)}")
                     except Exception as exc:
                         state.ready = False
                         fail(state.job.index, "prompt encoding", exc)
@@ -277,22 +284,34 @@ def run_jobs(
                 del te, qwen
                 gc.collect()
                 mx.clear_cache()
+                if progress:
+                    print("Text encoder released\n")
 
             stage = "transformer"
             if progress:
-                print("Loading 4-bit transformer once...")
+                print("Loading transformer...")
             tr = _load_transformer(snapshot)
+            if progress:
+                print("Denoising")
             try:
-                for state in states:
+                for position, state in enumerate(states, 1):
                     if not state.ready:
                         continue
                     data = latents = None
                     try:
-                        if progress:
-                            print(f"Denoising job {state.job.index}/{summary.total} ({state.job.steps} steps, seed {state.job.seed})...")
                         began = time.monotonic()
                         data = mx.load(str(state.embeds_path))
-                        latents = _denoise(state.job, tr, data["embeds"], data["mask"], model_config)
+
+                        def show_step(step: int, total: int) -> None:
+                            filled = round(20 * step / total)
+                            bar = "█" * filled + "░" * (20 - filled)
+                            line = f"  [{position:02d}/{len(states):02d}] [{bar}] {step}/{total}"
+                            if sys.stdout.isatty():
+                                print(f"\r{line}", end="\n" if step == total else "", flush=True)
+                            elif step == total:
+                                print(line)
+
+                        latents = _denoise(state.job, tr, data["embeds"], data["mask"], model_config, show_step if progress else None)
                         mx.savez(str(state.latents_path), latents=latents)
                         state.compute_seconds += time.monotonic() - began
                     except Exception as exc:
@@ -307,13 +326,17 @@ def run_jobs(
                 del tr
                 gc.collect()
                 mx.clear_cache()
+                if progress:
+                    print("Transformer released\n")
 
             stage = "VAE"
             if progress:
-                print("Loading VAE once...")
+                print("Loading VAE...")
             vae = _load_vae(snapshot)
+            if progress:
+                print("Decoding")
             try:
-                for state in states:
+                for position, state in enumerate(states, 1):
                     if not state.ready:
                         continue
                     data = unpacked = decoded = None
@@ -334,6 +357,8 @@ def run_jobs(
                             peak_metal_gb=mx.get_peak_memory() / (1024**3),
                         )
                         summary.completed.append(result)
+                        if progress:
+                            print(f"  [{position:02d}/{len(states):02d}] saved")
                         if on_complete:
                             on_complete(result)
                     except Exception as exc:
@@ -348,6 +373,8 @@ def run_jobs(
                 del vae
                 gc.collect()
                 mx.clear_cache()
+                if progress:
+                    print("VAE released")
         except KeyboardInterrupt:
             summary.interrupted = True
         except Exception as exc:

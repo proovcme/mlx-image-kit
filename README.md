@@ -13,20 +13,43 @@ python -m pip install .
 mlx-image
 ```
 
-Type a prompt to generate an image. For example:
+The startup screen shows the installed package version and current generation settings:
 
 ```text
-MLX IMAGE
-Qwen-Image 2.1 · 4-bit
-1152x768 | 20 steps | seed random | guidance 1.0
-Type a prompt, or /paste for multiline. /help for commands.
-> A red ceramic teapot on a wooden table, soft window light
-Generating 1152x768 | 20 steps | seed 1977 | guidance 1.0
-...
-Saved: outputs/YYYYMMDD_HHMMSS.png
+MLX Image 0.3.0
+Qwen-Image 2.1 · MLX 4-bit
+
+  1152×768 · 20 steps · seed random · guidance 1.0
+
+  Type a prompt
+  /paste multiline · /help commands · /quit exit
+
+image ›
 ```
 
-For a prompt with multiple paragraphs, enter `/paste`, paste all lines (including blank lines), then enter `/end` on its own line to generate. Enter `/cancel` instead to discard the prompt without generating.
+A one-line prompt starts generation immediately:
+
+```text
+image › A red ceramic teapot on a wooden table, soft window light
+```
+
+For multiple paragraphs, start `/paste` and finish with `/end`. The CLI preserves blank lines, Unicode, quotes, and shell characters literally; it generates only after `/end`. `/cancel` discards everything entered in this mode.
+
+```text
+image › /paste
+
+MULTILINE PROMPT
+Paste your prompt below.
+Finish with /end · cancel with /cancel
+│ A red ceramic teapot on a wooden table.
+│
+│ A small wooden cabin beside a mountain lake.
+│
+│ A lighthouse during a storm.
+│ /end
+```
+
+Before generation, the CLI shows the size, steps, resolved numeric seed, and guidance without repeating the prompt. On success it shows the PNG path, elapsed time, seed, and measured peak Metal memory when available. Ctrl+C at the main prompt clears the current input; during `/paste` it discards that prompt. Ctrl+D exits and discards any unfinished multiline prompt. If generation is interrupted, the CLI exits because the model's state may be unsafe to reuse; only completed jobs enter history.
 
 The seed and timestamp shown above illustrate the output format; an actual run chooses a random seed by default. Images go to `./outputs/` with timestamp names and a numeric suffix on collisions. Filenames never derive from prompts. Completed interactive and batch jobs are recorded privately in `./.history/history.jsonl` for `/repeat`; this folder is ignored by Git in this repository.
 
@@ -40,15 +63,16 @@ The seed and timestamp shown above illustrate the output format; an actual run c
 | `/seed N`, `/seed random` | Set a fixed or random seed |
 | `/guidance X` | Set guidance |
 | `/status` | Show current settings |
-| `/last`, `/history` | Show completed job details without printing prompts |
-| `/repeat` | Repeat the last prompt with exactly the same seed and settings |
-| `/open` | Open the last PNG with macOS `open` |
+| `/last` | Show the last generation's time, size, steps, seed, guidance, and output |
+| `/history` | Show up to 10 recent generations, newest first, without prompts |
+| `/repeat` | Repeat the last full prompt with exactly the same seed and settings |
+| `/open` | Open the last PNG with macOS `open`; report if it is missing |
 | `/paste` | Start entering a multiline prompt, preserving blank lines |
 | `/end` | Finish a multiline prompt and generate one image |
 | `/cancel` | Discard a multiline prompt without generating |
 | `/help`, `/quit` | Show commands or exit |
 
-Defaults are 1152x768, 20 steps, guidance 1.0, and a random seed. The actual seed is shown before generation and saved in local history. Use `mlx-image --model-path PATH` to select an existing model snapshot.
+`/help` groups commands by prompt, image, generation, history, and other actions. `/status` shows settings, model, precision, runtime, source (HF cache or local snapshot), and output directory. Setting commands give short confirmation; invalid values give a short error and keep the session running. Defaults are 1152×768, 20 steps, guidance 1.0, and a random seed. The actual seed is shown before generation and saved in local history. Use `mlx-image --model-path PATH` to select an existing model snapshot or `--output-dir PATH` to choose where images go. The CLI remains readable without ANSI color.
 
 ## Batch generation
 
@@ -77,6 +101,8 @@ mlx-image batch local/jobs.jsonl --output-dir outputs/
 ```
 
 `--count N` makes N images for each prompt. A fixed seed uses that seed, then seed + 1, seed + 2, and so on (wrapping at 2³²); `random` chooses a new seed for each variation. Each actual seed is recorded in local history. Job-specific JSONL fields override batch defaults. Auto-generated filenames contain only timestamps and numeric suffixes. Explicit JSONL `output` names are used as provided, with suffixes added if needed to avoid overwrites.
+
+Batch accepts `--portrait`, `--landscape`, `--square`, or `--size WIDTHxHEIGHT`, plus `--steps`, `--seed`, `--guidance`, `--count`, `--output-dir`, and `--model-path`. It shows a job count and default settings, then encoding, denoising, decoding, and model-release progress. Its summary reports completed and failed counts, elapsed time, and measured peak Metal memory when available. Failures identify the job number without printing its prompt. Run `mlx-image batch --help` for the full option list.
 
 The batch engine validates jobs before loading weights. It loads the text encoder once and writes one prompt embedding at a time to a temporary directory. It then loads the transformer once, sequentially denoises jobs, and stores latents temporarily. Finally it loads the VAE once to decode and save each PNG. Intermediate arrays are removed after use; peak unified memory does not grow linearly with job count. A failed job is reported by index without printing its prompt, and completed PNGs are retained. Ctrl+C stops the batch and preserves history for completed jobs.
 
@@ -115,7 +141,15 @@ Each run follows the same order: load and quantize the text encoder, encode prom
 
 ## Native Q4 loader workaround
 
-The script includes a loader workaround required by the tested setup. The text encoder loader maps checkpoint keys from the `language_model.model` hierarchy into the quantized encoder module before strict loading. For the transformer, it creates a 4-bit module with group size 64, renames checkpoint keys beginning with `modulation.0.` and `time_text_embed.linear_` to their module paths, and loads the remapped weights strictly. The VAE loader separately renames some keys and selects tensors with matching shapes. This describes the code's behavior; the underlying cause of the naming differences has not been established.
+The working pipeline depends on a custom native 4-bit loader in [`mlx_image/engine.py`](mlx_image/engine.py). It does not replace the loader with the default mflux or Hugging Face model-loading path. The loader first gets a snapshot from the local Hugging Face cache, downloading missing files only when needed, or uses an existing `--model-path` snapshot. Each component is loaded and released in sequence to limit unified-memory use.
+
+| Component | Native Q4 loading behavior |
+| --- | --- |
+| Text encoder | Construct `Qwen21TextEncoder`, quantize to 4-bit affine with group size 64, map 904 checkpoint keys from `language_model.model.*` to module paths, then load with `strict=True`. The order is **quantize → remap → strict load**. |
+| Transformer | Construct `Qwen21Transformer`, quantize to native 4-bit with group size 64, rename `modulation.0.*` to `modulation.layers.1.*` and `time_text_embed.linear_*` to `time_text_embed.timestep_embedder.linear_*`, then load with `strict=True`. |
+| VAE | Rename `.gamma`/`.beta` to `.weight`/`.bias`, adapt downsampler and upsampler convolution paths, and apply the same fallback `.conv` mapping as the working prototype. Only checkpoint tensors whose mapped key exists and whose shape matches the VAE parameter are loaded; VAE update uses `strict=False`, as in the prototype. |
+
+The loader was compared against the original working benchmark implementation, not just this README. In the existing local snapshot, all 904 text-encoder mapping sources are present; the transformer has 3 `modulation.0.*` keys and 6 `time_text_embed.linear_*` keys requiring remapping, with no target-key collisions. For the VAE, 226 checkpoint tensors match the target keys and shapes, 12 have no matching target key, and none fail the shape check. Each of the three current loaders also completed a read-only load of that local snapshot without a prompt or image render. These checks do not claim that every future snapshot has the same keys. [`tests/test_loader.py`](tests/test_loader.py) locks down the quantization order, strict loading, remaps, and VAE shape-selection behavior without downloading weights. The cause of the upstream naming differences has not been established.
 
 ## Model and licenses
 

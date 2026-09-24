@@ -9,7 +9,8 @@ from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
-from mlx_image.cli import History, InteractiveSession, _batch_parser, parse_batch_jobs
+from mlx_image import engine
+from mlx_image.cli import History, InteractiveSession, _batch_parser, batch_main, parse_batch_jobs
 from mlx_image.engine import Job, Result, Summary, run_jobs
 
 PROMPT = "A red ceramic teapot on a wooden table"
@@ -120,7 +121,7 @@ class InteractiveTests(unittest.TestCase):
             root = Path(directory)
             generated = []
             lines = [
-                "A red ceramic teapot on a wooden table.",
+                "A red ceramic teapot on a wooden table. ‘Soft light’ & $shapes.",
                 "",
                 "  A small wooden cabin beside a mountain lake.",
                 "",
@@ -149,14 +150,16 @@ class InteractiveTests(unittest.TestCase):
                 history=History(root / ".history" / "history.jsonl"),
                 runner=runner,
             )
-            with patch("builtins.input", side_effect=read_input), contextlib.redirect_stdout(io.StringIO()) as output:
+            with patch("builtins.input", side_effect=read_input), patch("mlx_image.cli._version", return_value="0.3.0"), contextlib.redirect_stdout(io.StringIO()) as output:
                 self.assertEqual(session.run(), 0)
 
             self.assertEqual(len(generated), 1)
             self.assertEqual(generated[0].prompt, expected)
             self.assertEqual(session.history.read()[0]["prompt"], expected)
-            self.assertIn("Type a prompt, or /paste for multiline. /help for commands.", output.getvalue())
-            self.assertIn("Paste multiline prompt. Finish with /end. Cancel with /cancel.", output.getvalue())
+            self.assertIn("MLX Image 0.3.0", output.getvalue())
+            self.assertIn("  /paste multiline · /help commands · /quit exit", output.getvalue())
+            self.assertIn("MULTILINE PROMPT\nPaste your prompt below.\nFinish with /end · cancel with /cancel", output.getvalue())
+            self.assertNotIn(expected, output.getvalue())
 
     def test_cancel_discards_paste_and_short_prompt_still_generates(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -185,7 +188,7 @@ class InteractiveTests(unittest.TestCase):
             self.assertEqual(len(generated), 1)
             self.assertEqual(generated[0].prompt, PROMPT)
             self.assertEqual(len(session.history.read()), 1)
-            self.assertIn("/paste /end /cancel", output.getvalue())
+            self.assertIn("/paste              multiline prompt (/end to generate, /cancel to discard)", output.getvalue())
 
     def test_commands_repeat_last_history_and_open_without_gui(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -225,6 +228,207 @@ class InteractiveTests(unittest.TestCase):
             self.assertEqual(opened[0][0], "open")
             self.assertNotIn(PROMPT, output.getvalue())
             self.assertEqual(len(session.history.read()), 2)
+
+
+class InteractiveUxTests(unittest.TestCase):
+    def make_session(self, root, generated, *, model_path=None):
+        def runner(jobs, *, model_path=None, on_complete=None):
+            generated.extend(jobs)
+            result = Result(jobs[0], "2026-09-24T12:00:00+03:00", 1.0, 4.2)
+            if on_complete:
+                on_complete(result)
+            return Summary(1, completed=[result], elapsed_seconds=1.0)
+
+        return InteractiveSession(
+            model_path=model_path,
+            output_dir=root / "outputs",
+            history=History(root / ".history" / "history.jsonl"),
+            runner=runner,
+        )
+
+    def test_startup_help_and_status_are_readable_without_color(self):
+        with tempfile.TemporaryDirectory() as directory:
+            generated = []
+            session = self.make_session(Path(directory), generated, model_path=Path("/synthetic/model"))
+            with (
+                patch("mlx_image.cli._version", return_value="0.3.0"),
+                patch("builtins.input", side_effect=["/help", "/status", "/quit"]) as read_input,
+                contextlib.redirect_stdout(io.StringIO()) as output,
+            ):
+                self.assertEqual(session.run(), 0)
+            screen = output.getvalue()
+            self.assertIn("MLX Image 0.3.0\nQwen-Image 2.1 · MLX 4-bit", screen)
+            self.assertIn("1152×768 · 20 steps · seed random · guidance 1.0", screen)
+            for heading in ("Prompt", "Image", "Generation", "History", "Other"):
+                self.assertIn(heading, screen)
+            self.assertIn("  source     local snapshot", screen)
+            self.assertIn("  directory  ", screen)
+            self.assertEqual(read_input.call_args_list[0].args[0], "image › ")
+            self.assertNotIn("\x1b[", screen)
+            self.assertEqual(generated, [])
+
+    def test_preset_settings_and_human_validation_feedback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            generated = []
+            session = self.make_session(Path(directory), generated)
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                for command, size in (("/portrait", (768, 1152)), ("/landscape", (1152, 768)), ("/square", (1024, 1024)), ("/size 256x512", (256, 512))):
+                    self.assertTrue(session.handle(command))
+                    self.assertEqual((session.settings.width, session.settings.height), size)
+                for command in ("/size 1000x777", "/steps banana", "/steps 30", "/seed 1977", "/seed random", "/guidance -2", "/guidance 1.5"):
+                    self.assertTrue(session.handle(command))
+                self.assertTrue(session.handle("/status"))
+            screen = output.getvalue()
+            for feedback in (
+                "✓ size 768×1152", "✓ size 1152×768", "✓ size 1024×1024", "✓ size 256×512",
+                "✗ width and height must be divisible by 16", "✗ steps must be an integer",
+                "✓ steps 30", "✓ seed 1977", "✓ seed random",
+                "✗ guidance must be greater than 0", "✓ guidance 1.5", "  source     HF cache",
+            ):
+                self.assertIn(feedback, screen)
+            self.assertEqual((session.settings.width, session.settings.height, session.settings.steps, session.settings.seed, session.settings.guidance), (256, 512, 30, None, 1.5))
+            self.assertNotIn("Traceback", screen)
+            self.assertEqual(generated, [])
+
+    def test_empty_paste_and_cancel_do_not_generate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            generated = []
+            session = self.make_session(Path(directory), generated)
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                for command in ("/paste", "", "", "/end", "/paste", PROMPT, "/cancel"):
+                    self.assertTrue(session.handle(command))
+            self.assertEqual(generated, [])
+            self.assertEqual(session.history.read(), [])
+            self.assertIn("✗ prompt is empty; nothing generated", output.getvalue())
+
+    def test_ctrl_c_in_normal_and_multiline_input_and_ctrl_d_cancel(self):
+        with tempfile.TemporaryDirectory() as directory:
+            generated = []
+            session = self.make_session(Path(directory), generated)
+            with patch("builtins.input", side_effect=[KeyboardInterrupt(), "/paste", PROMPT, KeyboardInterrupt(), "/paste", PROMPT, EOFError()]), contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(session.run(), 0)
+            self.assertEqual(generated, [])
+            self.assertIsNone(session._paste_lines)
+            self.assertIn("Input cancelled", output.getvalue())
+            self.assertEqual(output.getvalue().count("Multiline prompt cancelled"), 2)
+
+    def test_last_history_repeat_and_open_failure_hide_prompt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            generated = []
+            session = self.make_session(Path(directory), generated)
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                session.handle("/open")
+                session.handle("/size 256x256")
+                session.handle("/steps 3")
+                session.handle("/seed 1977")
+                session.handle("/guidance 1.5")
+                session.handle(PROMPT)
+                session.handle("/last")
+                session.handle("/history")
+                session.handle("/open")
+                session.handle("/repeat")
+            self.assertEqual(len(generated), 2)
+            self.assertEqual((generated[1].prompt, generated[1].seed, generated[1].width, generated[1].height, generated[1].steps, generated[1].guidance), (PROMPT, 1977, 256, 256, 3, 1.5))
+            self.assertEqual(len(session.history.read()), 2)
+            screen = output.getvalue()
+            self.assertIn("✗ no generated image yet", screen)
+            self.assertIn("✗ last image no longer exists", screen)
+            self.assertIn("Last generation", screen)
+            self.assertIn("#  time", screen)
+            self.assertIn("REPEAT\n256×256 · 3 steps · seed 1977 · guidance 1.5", screen)
+            self.assertNotIn(PROMPT, screen)
+
+    def test_interrupt_during_generation_exits_interactive_safely(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session = InteractiveSession(
+                output_dir=Path(directory) / "outputs",
+                history=History(Path(directory) / ".history" / "history.jsonl"),
+                runner=lambda jobs, **kwargs: Summary(1, interrupted=True),
+            )
+            with patch("builtins.input", return_value=PROMPT), contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(session.run(), 130)
+            self.assertEqual(session.history.read(), [])
+            self.assertIn("Generation interrupted; leaving interactive mode", output.getvalue())
+
+
+class BatchUxTests(unittest.TestCase):
+    def test_batch_summary_uses_indices_and_never_prints_prompts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "prompts.txt"
+            source.write_text(PROMPT + "\n", encoding="utf-8")
+            history = History(root / ".history" / "history.jsonl")
+            observed = []
+
+            def runner(jobs, *, model_path=None, on_complete=None):
+                observed.extend(jobs)
+                result = Result(jobs[0], "2026-09-24T12:00:00+03:00", 1.0, 4.2)
+                if on_complete:
+                    on_complete(result)
+                return Summary(1, completed=[result], elapsed_seconds=1.0)
+
+            with patch("mlx_image.cli._run_jobs", side_effect=runner), patch("mlx_image.cli.History", return_value=history), contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(batch_main([str(source), "--output-dir", str(root / "outputs")]), 0)
+            screen = output.getvalue()
+            self.assertIn("BATCH\n1 jobs · 1152×768 default · 20 steps", screen)
+            self.assertIn("Completed  1", screen)
+            self.assertIn("Failed     0", screen)
+            self.assertIn("Peak Metal 4.20 GB", screen)
+            self.assertNotIn(PROMPT, screen)
+            self.assertNotIn("teapot", observed[0].output.name)
+            self.assertEqual(history.read()[0]["prompt"], PROMPT)
+
+    def test_engine_stage_progress_never_repeats_prompt(self):
+        class FakeQwen:
+            pass
+
+        class FakeCache:
+            def clear(self):
+                pass
+
+        def init_config(qwen, config):
+            qwen.prompt_cache = FakeCache()
+
+        def init_tokenizers(qwen, snapshot):
+            qwen.tokenizers = {"qwen21": object()}
+
+        def denoise(job, transformer, embeds, mask, config, on_step):
+            for step in range(1, job.steps + 1):
+                on_step(step, job.steps)
+            return "latents"
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            storage = {}
+            job = Job(1, PROMPT, root / "image.png", 256, 256, 3, 1977, 1.0)
+            with (
+                patch.object(engine, "_snapshot", return_value=Path("synthetic")),
+                patch.object(engine.ModelConfig, "qwen_image_21", return_value=object()),
+                patch.object(engine, "_load_text_encoder", return_value=object()),
+                patch.object(engine, "QwenImage21", FakeQwen),
+                patch.object(engine.Qwen21Initializer, "_init_config", side_effect=init_config),
+                patch.object(engine.Qwen21Initializer, "_init_tokenizers", side_effect=init_tokenizers),
+                patch.object(engine.Qwen21PromptEncoder, "encode_prompt", return_value=("embeds", "mask")),
+                patch.object(engine.mx, "savez", side_effect=lambda path, **values: storage.__setitem__(path, values)),
+                patch.object(engine.mx, "load", side_effect=lambda path: storage[path]),
+                patch.object(engine.mx, "eval"),
+                patch.object(engine.mx, "reset_peak_memory"),
+                patch.object(engine.mx, "clear_cache"),
+                patch.object(engine.mx, "get_peak_memory", return_value=4 * 1024**3),
+                patch.object(engine, "_load_transformer", return_value=object()),
+                patch.object(engine, "_denoise", side_effect=denoise),
+                patch.object(engine, "_load_vae", return_value=object()),
+                patch.object(engine.Qwen21LatentCreator, "unpack_latents", return_value=object()),
+                patch.object(engine.VAEUtil, "decode", return_value=object()),
+                patch.object(engine, "_save_png"),
+                contextlib.redirect_stdout(io.StringIO()) as output,
+            ):
+                summary = run_jobs([job])
+            self.assertEqual(len(summary.completed), 1)
+            screen = output.getvalue()
+            for label in ("Loading text encoder...", "Encoding prompt...", "Text encoder released", "Loading transformer...", "Denoising", "[01/01]", "Transformer released", "Loading VAE...", "Decoding", "VAE released"):
+                self.assertIn(label, screen)
+            self.assertNotIn(PROMPT, screen)
 
 
 if __name__ == "__main__":

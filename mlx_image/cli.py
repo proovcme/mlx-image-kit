@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import secrets
 import subprocess
@@ -12,6 +13,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Callable
 
@@ -47,9 +49,32 @@ def _size(value: str) -> tuple[int, int]:
         width, height = (int(part) for part in value.lower().split("x"))
     except (TypeError, ValueError) as exc:
         raise ValueError("size must be WIDTHxHEIGHT") from exc
-    if width <= 0 or height <= 0 or width % 16 or height % 16:
-        raise ValueError("width and height must be positive multiples of 16")
+    if width <= 0 or height <= 0:
+        raise ValueError("width and height must be positive")
+    if width % 16 or height % 16:
+        raise ValueError("width and height must be divisible by 16")
     return width, height
+
+
+def _version() -> str:
+    try:
+        return version("mlx-image-kit")
+    except PackageNotFoundError:
+        return "development"
+
+
+def _display_path(path: Path) -> str:
+    try:
+        relative = path.resolve().relative_to(Path.cwd().resolve())
+        return f"./{relative}"
+    except ValueError:
+        return str(path)
+
+
+def _peak_line(value: float) -> str | None:
+    if math.isfinite(value) and value > 0:
+        return f"  peak Metal {value:.2f} GB"
+    return None
 
 
 def _positive_int(value: str) -> int:
@@ -159,10 +184,22 @@ class InteractiveSession:
         self.opener = opener
         self.reserved: set[Path] = set()
         self._paste_lines: list[str] | None = None
+        self._interrupted = False
 
     def status(self) -> None:
         s = self.settings
-        print(f"{s.width}x{s.height} | {s.steps} steps | seed {s.seed if s.seed is not None else 'random'} | guidance {s.guidance}")
+        print("Generation")
+        print(f"  size       {s.width}×{s.height}")
+        print(f"  steps      {s.steps}")
+        print(f"  seed       {s.seed if s.seed is not None else 'random'}")
+        print(f"  guidance   {s.guidance}")
+        print("\nModel")
+        print("  model      Qwen-Image 2.1")
+        print("  precision  4-bit")
+        print("  runtime    MLX")
+        print(f"  source     {'local snapshot' if self.model_path else 'HF cache'}")
+        print("\nOutput")
+        print(f"  directory  {_display_path(self.output_dir)}/")
 
     def _last(self) -> dict | None:
         try:
@@ -173,8 +210,21 @@ class InteractiveSession:
         return records[-1] if records else None
 
     def _show_record(self, record: dict) -> None:
-        print(f"{record['timestamp']} | {record['width']}x{record['height']} | {record['steps']} steps | seed {record['seed']} | guidance {record['guidance']}")
-        print(f"Output: {record['output']}")
+        print("Last generation")
+        print(f"  time       {record['timestamp'][:16].replace('T', ' ')}")
+        print(f"  size       {record['width']}×{record['height']}")
+        print(f"  steps      {record['steps']}")
+        print(f"  seed       {record['seed']}")
+        print(f"  guidance   {record['guidance']}")
+        print(f"  output     {_display_path(Path(record['output']))}")
+
+    def _show_history(self, records: list[dict]) -> None:
+        print("#  time              size       seed        output")
+        for index, record in enumerate(reversed(records[-10:]), 1):
+            stamp = record["timestamp"][:16].replace("T", " ")
+            size = f"{record['width']}×{record['height']}"
+            output = _display_path(Path(record["output"]))
+            print(f"{index:<2} {stamp:<17} {size:<10} {record['seed']:<11} {output}")
 
     def _record(self, result: Result) -> None:
         try:
@@ -192,21 +242,33 @@ class InteractiveSession:
             steps, seed, guidance = s.steps, _actual_seed(s.seed), s.guidance
         output = _unique_output(self.output_dir, self.reserved)
         job = Job(1, prompt, output, width, height, steps, seed, guidance)
-        print(f"Generating {width}x{height} | {steps} steps | seed {seed} | guidance {guidance}")
-        summary = self.runner([job], model_path=self.model_path, on_complete=self._record)
+        print(f"\n{'REPEAT' if repeat else 'GENERATE'}")
+        print(f"{width}×{height} · {steps} steps · seed {seed} · guidance {guidance}")
+        try:
+            summary = self.runner([job], model_path=self.model_path, on_complete=self._record)
+        except KeyboardInterrupt:
+            summary = Summary(1, interrupted=True)
+        except Exception as exc:
+            summary = Summary(1, failed=[Failure(1, f"internal error ({type(exc).__name__})")])
+        self._interrupted = summary.interrupted
         try:
             self.history.ensure(summary.completed)
         except (OSError, ValueError):
             print("Local history could not be saved")
         if summary.completed:
             result = summary.completed[0]
-            print(f"Saved: {os.path.relpath(result.job.output)}")
-            print(f"Elapsed: {summary.elapsed_seconds:.2f} s | Seed: {seed} | Peak Metal: {result.peak_metal_gb:.2f} GB")
+            print(f"✓ Saved  {_display_path(result.job.output)}")
+            print(f"  {summary.elapsed_seconds:.1f} s · seed {seed}")
+            peak = _peak_line(result.peak_metal_gb)
+            if peak:
+                print(peak)
+            if summary.interrupted:
+                print("Generation interrupted; leaving interactive mode")
         elif summary.interrupted:
-            print("Generation interrupted")
+            print("Generation interrupted; leaving interactive mode")
         else:
             for failure in summary.failed:
-                print(f"Generation failed: {failure.message}")
+                print(f"✗ generation failed: {failure.message}")
         return summary
 
     def handle(self, line: str) -> bool:
@@ -220,7 +282,7 @@ class InteractiveSession:
                 if prompt.strip():
                     self.generate(prompt)
                 else:
-                    print("Empty prompt; nothing generated")
+                    print("✗ prompt is empty; nothing generated")
             else:
                 self._paste_lines.append(line)
             return True
@@ -236,23 +298,31 @@ class InteractiveSession:
         try:
             if name in PRESETS and not argument:
                 self.settings.width, self.settings.height = PRESETS[name]
-                self.status()
+                print(f"✓ size {self.settings.width}×{self.settings.height}")
             elif name == "size":
                 self.settings.width, self.settings.height = _size(argument)
-                self.status()
+                print(f"✓ size {self.settings.width}×{self.settings.height}")
             elif name == "steps":
-                value = _positive_int(argument)
+                try:
+                    value = int(argument)
+                except ValueError as exc:
+                    raise ValueError("steps must be an integer") from exc
+                if value <= 0:
+                    raise ValueError("steps must be greater than 0")
                 self.settings.steps = value
-                self.status()
+                print(f"✓ steps {value}")
             elif name == "seed":
                 self.settings.seed = _seed(argument)
-                self.status()
+                print(f"✓ seed {self.settings.seed if self.settings.seed is not None else 'random'}")
             elif name == "guidance":
-                value = float(argument)
-                if not 0 <= value < float("inf"):
-                    raise ValueError("guidance must be finite and nonnegative")
+                try:
+                    value = float(argument)
+                except ValueError as exc:
+                    raise ValueError("guidance must be a number") from exc
+                if not math.isfinite(value) or value <= 0:
+                    raise ValueError("guidance must be greater than 0")
                 self.settings.guidance = value
-                self.status()
+                print(f"✓ guidance {value}")
             elif name == "status" and not argument:
                 self.status()
             elif name == "last" and not argument:
@@ -265,8 +335,8 @@ class InteractiveSession:
                 records = self.history.read()
                 if not records:
                     print("No completed generation")
-                for record in records[-10:]:
-                    self._show_record(record)
+                else:
+                    self._show_history(records)
             elif name == "repeat" and not argument:
                 record = self._last()
                 if record:
@@ -275,36 +345,70 @@ class InteractiveSession:
                     print("No completed generation")
             elif name == "open" and not argument:
                 record = self._last()
-                if record and Path(record["output"]).is_file():
-                    self.opener(["open", record["output"]], check=False)
+                if not record:
+                    print("✗ no generated image yet")
+                elif not Path(record["output"]).is_file():
+                    print("✗ last image no longer exists")
                 else:
-                    print("No completed PNG to open")
+                    opened = self.opener(["open", record["output"]], check=False)
+                    if getattr(opened, "returncode", 0):
+                        print("✗ could not open the last image")
+                    else:
+                        print(f"✓ opened {_display_path(Path(record['output']))}")
             elif name == "paste" and not argument:
                 self._paste_lines = []
-                print("Paste multiline prompt. Finish with /end. Cancel with /cancel.")
+                print("\nMULTILINE PROMPT")
+                print("Paste your prompt below.")
+                print("Finish with /end · cancel with /cancel")
             elif name in ("end", "cancel") and not argument:
-                print("No multiline prompt in progress")
+                print("✗ no multiline prompt in progress")
             elif name == "help" and not argument:
-                print("/portrait /landscape /square /size WIDTHxHEIGHT /steps N /seed N|random /guidance X")
-                print("/status /last /repeat /history /open /paste /end /cancel /help /quit")
-                print("/paste starts multiline input; /end generates; /cancel discards it")
+                print("Prompt")
+                print("  /paste              multiline prompt (/end to generate, /cancel to discard)")
+                print("\nImage")
+                print("  /portrait           768×1152")
+                print("  /landscape          1152×768")
+                print("  /square             1024×1024")
+                print("  /size WxH           custom size")
+                print("\nGeneration")
+                print("  /steps N            inference steps")
+                print("  /seed N|random      fixed or random seed")
+                print("  /guidance X         guidance scale")
+                print("\nHistory")
+                print("  /last               last generation")
+                print("  /repeat             repeat last prompt and settings")
+                print("  /history            last 10 generations")
+                print("  /open               open last PNG")
+                print("\nOther")
+                print("  /status             current settings")
+                print("  /help               show commands")
+                print("  /quit               exit")
             elif name == "quit" and not argument:
                 return False
             else:
-                print("Unknown command; use /help")
-        except (ValueError, argparse.ArgumentTypeError, OSError):
-            print("Invalid command value")
+                print("✗ unknown command; use /help")
+        except (ValueError, argparse.ArgumentTypeError) as exc:
+            print(f"✗ {exc}")
+        except OSError:
+            print("✗ operation failed; check the file or directory")
+        except Exception as exc:
+            print(f"✗ internal error ({type(exc).__name__})")
         return True
 
     def run(self) -> int:
-        print("MLX IMAGE")
-        print("Qwen-Image 2.1 · 4-bit")
-        self.status()
-        print("Type a prompt, or /paste for multiline. /help for commands.")
+        s = self.settings
+        print(f"MLX Image {_version()}")
+        print("Qwen-Image 2.1 · MLX 4-bit")
+        print(f"\n  {s.width}×{s.height} · {s.steps} steps · seed random · guidance {s.guidance}")
+        print("\n  Type a prompt")
+        print("  /paste multiline · /help commands · /quit exit\n")
         while True:
             try:
-                line = input("> ")
+                line = input("│ " if self._paste_lines is not None else "image › ")
             except EOFError:
+                if self._paste_lines is not None:
+                    self._paste_lines = None
+                    print("\nMultiline prompt cancelled")
                 print()
                 return 0
             except KeyboardInterrupt:
@@ -316,6 +420,8 @@ class InteractiveSession:
                 continue
             if not self.handle(line):
                 return 0
+            if self._interrupted:
+                return 130
 
 
 def _batch_parser() -> argparse.ArgumentParser:
@@ -402,29 +508,53 @@ def batch_main(argv: list[str]) -> int:
     began = time.monotonic()
     try:
         jobs, parse_failures = parse_batch_jobs(args)
-    except (OSError, UnicodeError, ValueError) as exc:
-        print(f"Batch input error: {type(exc).__name__}")
+    except FileNotFoundError:
+        print("✗ input file not found")
+        return 2
+    except PermissionError:
+        print("✗ input file cannot be read")
+        return 2
+    except UnicodeError:
+        print("✗ input file must be UTF-8 text")
+        return 2
+    except ValueError as exc:
+        print(f"✗ {exc}")
+        return 2
+    except OSError:
+        print("✗ input file cannot be read")
         return 2
     if not jobs and not parse_failures:
-        print("No jobs in input")
+        print("✗ no jobs in input")
         return 2
+    if args.size:
+        default_width, default_height = _size(args.size)
+    else:
+        preset = next((name for name in PRESETS if getattr(args, name)), "landscape")
+        default_width, default_height = PRESETS[preset]
+    print("BATCH")
+    print(f"{len(jobs) + len(parse_failures)} jobs · {default_width}×{default_height} default · {args.steps} steps\n")
     history = History()
 
     def record(result: Result) -> None:
         try:
             history.append(result)
         except (OSError, ValueError):
-            print(f"Job {result.job.index}: local history could not be saved")
+            print(f"✗ job {result.job.index}: local history could not be saved")
 
     summary = _run_jobs(jobs, model_path=args.model_path, on_complete=record) if jobs else Summary(total=0)
     try:
         history.ensure(summary.completed)
     except (OSError, ValueError):
-        print("Local history could not be saved")
+        print("✗ local history could not be saved")
     all_failures = parse_failures + summary.failed
     for failure in all_failures:
-        print(f"Job {failure.index}: {failure.message}")
-    print(f"Total: {len(jobs) + len(parse_failures)} | Completed: {len(summary.completed)} | Failed: {len(all_failures)} | Elapsed: {time.monotonic() - began:.2f} s")
+        print(f"✗ job {failure.index}: {failure.message}")
+    print(f"\nCompleted  {len(summary.completed)}")
+    print(f"Failed     {len(all_failures)}")
+    print(f"Elapsed    {time.monotonic() - began:.1f} s")
+    peaks = [result.peak_metal_gb for result in summary.completed if math.isfinite(result.peak_metal_gb) and result.peak_metal_gb > 0]
+    if peaks:
+        print(f"Peak Metal {max(peaks):.2f} GB")
     if summary.interrupted:
         print("Batch interrupted; completed PNGs and history are retained")
         return 130
