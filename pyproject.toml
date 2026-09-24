@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mlx-image-kit"
+version = "0.2.0"
+description = "Local MLX image generation CLI for Apple Silicon"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = [
+    "mlx==0.32.2",
+    "mflux==0.20.0",
+    "huggingface-hub==1.32.0",
+]
+
+[project.scripts]
+mlx-image = "mlx_image.cli:main"
+
+[tool.setuptools]
+py-modules = ["generate"]
+packages = ["mlx_image"]
