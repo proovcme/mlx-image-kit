@@ -16,7 +16,7 @@ def parse_args():
     parser.add_argument("--steps", type=int, default=20, help="Inference steps (default: 20)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed (default: 42)")
     parser.add_argument("--guidance", type=float, default=1.0, help="Guidance scale (default: 1.0)")
-    parser.add_argument("--cache", choices=("off", "experimental"), default="off", help="Denoising cache mode (default: off)")
+    parser.add_argument("--cache", choices=("off", "balanced"), default="off", help="Denoising cache mode (default: off)")
     parser.add_argument("--model-path", type=Path, help="Local model snapshot directory; otherwise use the Hugging Face cache")
     return parser.parse_args()
 
@@ -41,6 +41,8 @@ def main() -> int:
         from mlx_image.cli import _cache_config
 
         kwargs["cache_config"] = _cache_config(args.cache)
+    print("GENERATE")
+    print(f"{job.width}×{job.height} · {job.steps} steps · seed {job.seed} · guidance {job.guidance} · cache {job.cache_mode}")
     summary = run_jobs([job], **kwargs)
     if summary.completed:
         result = summary.completed[0]

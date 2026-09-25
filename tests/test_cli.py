@@ -49,6 +49,17 @@ class BatchParsingTests(unittest.TestCase):
             self.assertEqual([j.output.name for j in jobs[:2]], ["image-a.png", "image-a_2.png"])
             self.assertEqual([j.seed for j in jobs[2:]], [1977, 1978])
 
+    def test_jsonl_uses_batch_cache_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "jobs.jsonl"
+            source.write_text(json.dumps({"prompt": PROMPT}) + "\n")
+            args = _batch_parser().parse_args([str(source), "--cache", "balanced"])
+            jobs, failures = parse_batch_jobs(args)
+            self.assertFalse(failures)
+            self.assertEqual(len(jobs), 1)
+            self.assertEqual(jobs[0].cache_mode, "balanced")
+
     def test_random_variations_use_separate_actual_seeds(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -131,12 +142,55 @@ class HistoryTests(unittest.TestCase):
 
             session = InteractiveSession(history=history, output_dir=root, runner=runner)
             with contextlib.redirect_stdout(io.StringIO()):
-                session.handle("/cache experimental")
+                session.handle("/cache balanced")
                 session.handle("/repeat")
             self.assertEqual(observed[0].cache_mode, "off")
 
+    def test_pre_release_history_mode_repeats_as_balanced(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            history = History(root / ".history" / "history.jsonl")
+            history.append(self._result(root))
+            record = history.read()[0]
+            record["cache"] = "experimental"
+            history.path.write_text(json.dumps(record) + "\n")
+            observed = []
+
+            def runner(jobs, **kwargs):
+                observed.append((jobs[0], kwargs["cache_config"]))
+                return Summary(1)
+
+            session = InteractiveSession(history=history, output_dir=root, runner=runner)
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                session.handle("/last")
+                session.handle("/repeat")
+            self.assertEqual(observed[0][0].cache_mode, "balanced")
+            self.assertEqual(observed[0][1].threshold, 0.08)
+            self.assertIn("cache      balanced", output.getvalue())
+            self.assertNotIn("experimental", output.getvalue())
+
 
 class InteractiveTests(unittest.TestCase):
+    def test_default_cache_is_off(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            observed = []
+
+            def runner(jobs, **kwargs):
+                observed.append((jobs[0], kwargs))
+                return Summary(1)
+
+            session = InteractiveSession(history=History(root / ".history" / "history.jsonl"),
+                                         output_dir=root, runner=runner)
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                session.handle("/status")
+                session.handle(PROMPT)
+            self.assertEqual(session.settings.cache, "off")
+            self.assertEqual(observed[0][0].cache_mode, "off")
+            self.assertNotIn("cache_config", observed[0][1])
+            self.assertIn("cache      off", output.getvalue())
+            self.assertIn("· cache off", output.getvalue())
+
     def test_cache_command_status_history_and_repeat(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -152,15 +206,23 @@ class InteractiveTests(unittest.TestCase):
             session = InteractiveSession(history=History(root / ".history" / "history.jsonl"),
                                          output_dir=root / "outputs", runner=runner)
             with contextlib.redirect_stdout(io.StringIO()) as output:
-                session.handle("/cache experimental")
+                session.handle("/cache balanced")
                 session.handle("/status")
                 session.handle(PROMPT)
                 session.handle("/cache off")
                 session.handle("/repeat")
-            self.assertEqual([job.cache_mode for job, _ in observed], ["experimental", "experimental"])
+                session.handle("/cache invalid")
+                session.handle("/help")
+            self.assertEqual([job.cache_mode for job, _ in observed], ["balanced", "balanced"])
             self.assertEqual([config.threshold for _, config in observed], [0.08, 0.08])
-            self.assertEqual([record["cache"] for record in session.history.read()], ["experimental", "experimental"])
-            self.assertIn("cache      experimental", output.getvalue())
+            self.assertEqual([record["cache"] for record in session.history.read()], ["balanced", "balanced"])
+            self.assertIn("cache      balanced", output.getvalue())
+            self.assertIn("✓ cache balanced", output.getvalue())
+            self.assertIn("✓ cache off", output.getvalue())
+            self.assertIn("✗ cache must be off or balanced", output.getvalue())
+            self.assertIn("/cache off|balanced", output.getvalue())
+            self.assertIn("· cache balanced", output.getvalue())
+            self.assertNotIn("experimental", output.getvalue())
             self.assertNotIn(PROMPT, output.getvalue())
 
     def test_direct_and_batch_cache_argument(self):
@@ -168,16 +230,16 @@ class InteractiveTests(unittest.TestCase):
             root = Path(directory)
             source = root / "prompts.txt"
             source.write_text(PROMPT + "\n")
-            args = _batch_parser().parse_args([str(source), "--cache", "experimental"])
+            args = _batch_parser().parse_args([str(source), "--cache", "balanced"])
             jobs, failures = parse_batch_jobs(args)
             self.assertFalse(failures)
-            self.assertEqual(jobs[0].cache_mode, "experimental")
+            self.assertEqual(jobs[0].cache_mode, "balanced")
             started = []
             with patch("mlx_image.cli.InteractiveSession.run", autospec=True,
                        side_effect=lambda session: started.append(session.settings.cache) or 0) as run:
-                self.assertEqual(main(["--cache", "experimental"]), 0)
+                self.assertEqual(main(["--cache", "balanced"]), 0)
                 self.assertEqual(len(run.call_args.args), 1)
-            self.assertEqual(started, ["experimental"])
+            self.assertEqual(started, ["balanced"])
 
             observed = []
 
@@ -186,8 +248,8 @@ class InteractiveTests(unittest.TestCase):
                 return Summary(len(batch_jobs))
 
             with patch("mlx_image.cli._run_jobs", side_effect=runner), contextlib.redirect_stdout(io.StringIO()):
-                self.assertEqual(batch_main([str(source), "--cache", "experimental"]), 0)
-            self.assertEqual(observed[0][0][0].cache_mode, "experimental")
+                self.assertEqual(batch_main([str(source), "--cache", "balanced"]), 0)
+            self.assertEqual(observed[0][0][0].cache_mode, "balanced")
             self.assertEqual(observed[0][1].threshold, 0.08)
 
             direct = []
@@ -197,13 +259,24 @@ class InteractiveTests(unittest.TestCase):
                 return Summary(1, completed=[Result(direct_jobs[0], "2026-09-24T12:00:00+03:00", 1.0, 4.2)])
 
             with (
-                patch("sys.argv", ["generate.py", "--prompt", PROMPT, "--cache", "experimental"]),
+                patch("sys.argv", ["generate.py", "--prompt", PROMPT, "--cache", "balanced"]),
                 patch("mlx_image.engine.run_jobs", side_effect=direct_runner),
-                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stdout(io.StringIO()) as direct_output,
             ):
                 self.assertEqual(generate.main(), 0)
-            self.assertEqual(direct[0][0].cache_mode, "experimental")
+            self.assertEqual(direct[0][0].cache_mode, "balanced")
             self.assertEqual(direct[0][1].threshold, 0.08)
+            self.assertIn("GENERATE\n1024×1024 · 20 steps · seed 42 · guidance 1.0 · cache balanced", direct_output.getvalue())
+
+            for cache_arg in ([], ["--cache", "off"]):
+                with (
+                    patch("sys.argv", ["generate.py", "--prompt", PROMPT, *cache_arg]),
+                    patch("mlx_image.engine.run_jobs", side_effect=direct_runner),
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    self.assertEqual(generate.main(), 0)
+            self.assertEqual([job.cache_mode for job, _ in direct[1:]], ["off", "off"])
+            self.assertEqual([config for _, config in direct[1:]], [None, None])
 
     def test_paste_preserves_full_multiline_prompt_until_end(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -239,13 +312,13 @@ class InteractiveTests(unittest.TestCase):
                 history=History(root / ".history" / "history.jsonl"),
                 runner=runner,
             )
-            with patch("builtins.input", side_effect=read_input), patch("mlx_image.cli._version", return_value="0.3.0"), contextlib.redirect_stdout(io.StringIO()) as output:
+            with patch("builtins.input", side_effect=read_input), patch("mlx_image.cli._version", return_value="0.4.0"), contextlib.redirect_stdout(io.StringIO()) as output:
                 self.assertEqual(session.run(), 0)
 
             self.assertEqual(len(generated), 1)
             self.assertEqual(generated[0].prompt, expected)
             self.assertEqual(session.history.read()[0]["prompt"], expected)
-            self.assertIn("MLX Image 0.3.0", output.getvalue())
+            self.assertIn("MLX Image 0.4.0", output.getvalue())
             self.assertIn("  /paste multiline · /help commands · /quit exit", output.getvalue())
             self.assertIn("MULTILINE PROMPT\nPaste your prompt below.\nFinish with /end · cancel with /cancel", output.getvalue())
             self.assertNotIn(expected, output.getvalue())
@@ -340,13 +413,13 @@ class InteractiveUxTests(unittest.TestCase):
             generated = []
             session = self.make_session(Path(directory), generated, model_path=Path("/synthetic/model"))
             with (
-                patch("mlx_image.cli._version", return_value="0.3.0"),
+                patch("mlx_image.cli._version", return_value="0.4.0"),
                 patch("builtins.input", side_effect=["/help", "/status", "/quit"]) as read_input,
                 contextlib.redirect_stdout(io.StringIO()) as output,
             ):
                 self.assertEqual(session.run(), 0)
             screen = output.getvalue()
-            self.assertIn("MLX Image 0.3.0\nQwen-Image 2.1 · MLX 4-bit", screen)
+            self.assertIn("MLX Image 0.4.0\nQwen-Image 2.1 · MLX 4-bit", screen)
             self.assertIn("1152×768 · 20 steps · seed random · guidance 1.0", screen)
             for heading in ("Prompt", "Image", "Generation", "History", "Other"):
                 self.assertIn(heading, screen)
@@ -424,7 +497,7 @@ class InteractiveUxTests(unittest.TestCase):
             self.assertIn("✗ last image no longer exists", screen)
             self.assertIn("Last generation", screen)
             self.assertIn("#  time", screen)
-            self.assertIn("REPEAT\n256×256 · 3 steps · seed 1977 · guidance 1.5", screen)
+            self.assertIn("REPEAT\n256×256 · 3 steps · seed 1977 · guidance 1.5 · cache off", screen)
             self.assertNotIn(PROMPT, screen)
 
     def test_interrupt_during_generation_exits_interactive_safely(self):
@@ -459,7 +532,7 @@ class BatchUxTests(unittest.TestCase):
             with patch("mlx_image.cli._run_jobs", side_effect=runner), patch("mlx_image.cli.History", return_value=history), contextlib.redirect_stdout(io.StringIO()) as output:
                 self.assertEqual(batch_main([str(source), "--output-dir", str(root / "outputs")]), 0)
             screen = output.getvalue()
-            self.assertIn("BATCH\n1 jobs · 1152×768 default · 20 steps", screen)
+            self.assertIn("BATCH\n1 jobs · 1152×768 default · 20 steps · cache off", screen)
             self.assertIn("Completed  1", screen)
             self.assertIn("Failed     0", screen)
             self.assertIn("Peak Metal 4.20 GB", screen)

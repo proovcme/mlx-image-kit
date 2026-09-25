@@ -16,10 +16,10 @@ mlx-image
 The startup screen shows the installed package version and current generation settings:
 
 ```text
-MLX Image 0.3.0
+MLX Image 0.4.0
 Qwen-Image 2.1 · MLX 4-bit
 
-  1152×768 · 20 steps · seed random · guidance 1.0
+  1152×768 · 20 steps · seed random · guidance 1.0 · cache off
 
   Type a prompt
   /paste multiline · /help commands · /quit exit
@@ -49,7 +49,7 @@ Finish with /end · cancel with /cancel
 │ /end
 ```
 
-Before generation, the CLI shows the size, steps, resolved numeric seed, and guidance without repeating the prompt. On success it shows the PNG path, elapsed time, seed, and measured peak Metal memory when available. Ctrl+C at the main prompt clears the current input; during `/paste` it discards that prompt. Ctrl+D exits and discards any unfinished multiline prompt. If generation is interrupted, the CLI exits because the model's state may be unsafe to reuse; only completed jobs enter history.
+Before generation, the CLI shows the size, steps, resolved numeric seed, guidance, and cache mode without repeating the prompt. On success it shows the PNG path, elapsed time, seed, and measured peak Metal memory when available. Ctrl+C at the main prompt clears the current input; during `/paste` it discards that prompt. Ctrl+D exits and discards any unfinished multiline prompt. If generation is interrupted, the CLI exits because the model's state may be unsafe to reuse; only completed jobs enter history.
 
 The seed and timestamp shown above illustrate the output format; an actual run chooses a random seed by default. Images go to `./outputs/` with timestamp names and a numeric suffix on collisions. Filenames never derive from prompts. Completed interactive and batch jobs are recorded privately in `./.history/history.jsonl` for `/repeat`; this folder is ignored by Git in this repository.
 
@@ -62,7 +62,7 @@ The seed and timestamp shown above illustrate the output format; an actual run c
 | `/steps N` | Set inference steps |
 | `/seed N`, `/seed random` | Set a fixed or random seed |
 | `/guidance X` | Set guidance |
-| `/cache off`, `/cache experimental` | Choose vanilla denoising or the optional experimental cache |
+| `/cache off`, `/cache balanced` | Choose vanilla denoising or optional balanced cache |
 | `/status` | Show current settings, including cache mode |
 | `/last` | Show the last generation's time, size, steps, seed, guidance, and output |
 | `/history` | Show up to 10 recent generations, newest first, without prompts |
@@ -73,7 +73,7 @@ The seed and timestamp shown above illustrate the output format; an actual run c
 | `/cancel` | Discard a multiline prompt without generating |
 | `/help`, `/quit` | Show commands or exit |
 
-`/help` groups commands by prompt, image, generation, history, and other actions. `/status` shows settings, cache mode, model, precision, runtime, source (HF cache or local snapshot), and output directory. Setting commands give short confirmation; invalid values give a short error and keep the session running. Defaults are 1152×768, 20 steps, guidance 1.0, a random seed, and cache `off`. The actual seed is shown before generation and saved in local history. Use `mlx-image --model-path PATH` to select an existing model snapshot, `--output-dir PATH` to choose where images go, or `--cache experimental` to start in experimental mode. The CLI remains readable without ANSI color.
+`/help` groups commands by prompt, image, generation, history, and other actions. `/status` shows settings, cache mode, model, precision, runtime, source (HF cache or local snapshot), and output directory. Setting commands give short confirmation; invalid values give a short error and keep the session running. Defaults are 1152×768, 20 steps, guidance 1.0, a random seed, and cache `off`. The actual seed is shown before generation and saved in local history. Use `mlx-image --model-path PATH` to select an existing model snapshot, `--output-dir PATH` to choose where images go, or `--cache balanced` to start with cache enabled. The CLI remains readable without ANSI color.
 
 ## Batch generation
 
@@ -88,7 +88,7 @@ A lighthouse during a storm
 ```sh
 mlx-image batch local/prompts.txt --landscape --steps 20 --seed random --output-dir outputs/
 mlx-image batch local/prompts.txt --count 4
-mlx-image batch local/prompts.txt --cache experimental
+mlx-image batch local/prompts.txt --cache balanced
 ```
 
 A JSONL file can override settings for each job:
@@ -123,22 +123,29 @@ python generate.py \
   --guidance 1.0
 ```
 
-It also accepts `--model-path PATH` and `--cache off|experimental`. Run `python generate.py --help` or `mlx-image batch --help` for options.
+It also accepts `--model-path PATH` and `--cache off|balanced`. Run `python generate.py --help` or `mlx-image batch --help` for options.
 
-## Experimental denoising cache
+## Balanced cache
 
-The default `off` mode runs the original v0.3.0 denoising loop: one native Q4 transformer forward for every step. `experimental` keeps the last computed noise tensor within one image. After two full forwards, it estimates the next output change from the last measured output change and the change in the transformer's input. It reuses the last noise only when that estimate is at or below the locally calibrated threshold `0.08`. The first and last steps always execute, and at most two consecutive steps can reuse a result. Invalid metrics force a normal forward. This is a project-specific output-reuse experiment; it is not a direct port of TeaCache's old Qwen-Image residual cache or coefficients.
+`balanced` skips some transformer evaluations when consecutive denoising steps are sufficiently similar. Vanilla generation (`off`) remains the default and reference mode. Cache state is fresh for each image, including each batch job; the staged batch still loads the transformer once.
 
-```text
-image › /cache experimental
-image › /status
-  cache      experimental
-image › /cache off
+Interactive: `/cache balanced`
+
+```sh
+python generate.py --prompt "A red ceramic teapot on a wooden table" --cache balanced
+mlx-image batch local/prompts.txt --cache balanced
 ```
 
-The mode is stored in private local history and `/repeat` restores it; old history entries without a cache field use `off`. Batch reuses the loaded transformer but creates a fresh cache for every image. The mechanism runs only after the custom native Q4 transformer loader has completed. It does not change the scheduler, weights, quantization, text encoder, VAE, or model loading. Cache mode is an explicit image-quality tradeoff; compare it with `off` for your own scenes.
+The mode is stored in private local history and `/repeat` restores it. Old history entries without a cache field use `off`. Balanced cache runs after the custom native Q4 loader; it does not change the weights, scheduler, text encoder, or VAE.
 
-The [TeaCache paper](https://arxiv.org/abs/2411.19108) and [mlx-teacache's Qwen-Image variant](https://github.com/IonDen/mlx-teacache/blob/main/docs/variants/qwen-image.md) informed this experiment, but that Qwen variant targets the older dual-stream transformer. Qwen-Image 2.1 uses a [single-stream block-causal transformer](https://github.com/QwenLM/Qwen-Image-2.1#architecture). The older fitted coefficients did not predict output change reliably in our three 20-step neutral scenes, so this project measures the last actual noise-output change instead. No third-party acceleration framework is required at runtime.
+| Tested workload | Cache off total | Balanced total | Denoising speedup | SSIM |
+| --- | ---: | ---: | ---: | ---: |
+| Full-size test 1: 1152×768, 20 steps | 377.08 s | 227.49 s | 1.67× | 0.9645 |
+| Full-size test 2: 1152×768, 20 steps | 448.13 s | 299.06 s | 1.53× | 0.9732 |
+
+In two tested 1152×768 / 20-step workloads, balanced cache reduced total wall time from 377 s to 227 s and from 448 s to 299 s. Results vary by workload. Visual differences remain possible; `off` is the reference mode and `balanced` is optional.
+
+The cache mechanism is a small project-specific implementation inspired by transformer caching approaches such as [TeaCache](https://arxiv.org/abs/2411.19108) and [Cache-DiT](https://github.com/vipshop/cache-dit). It is not a direct port, and no third-party acceleration code or runtime dependency was added.
 
 ## Tested hardware and results
 
@@ -150,10 +157,8 @@ Mac mini M4 with 24 GB unified memory.
 | Earlier packaged script smoke test | 256x256 | 20 | 1.0 | 35.85 s | 4.23 GB | No increase during test |
 | Current shared-engine direct smoke test | 256x256 | 20 | 1.0 | 38.27 s | 4.23 GB | Not measured |
 | Previous v0.3.0 regression | 1152x768 | 20 | 1.0 | 415.10 s | 12.70 GB | Not reported |
-| This branch, cache off A | 1152x768 | 20 | 1.0 | 377.08 s | 13.33 GB | −32 MB system-wide delta |
-| This branch, cache experimental B | 1152x768 | 20 | 1.0 | 227.49 s | 13.33 GB | 0 MB system-wide delta |
 
-For the original benchmark, prompt encoding took about 8.6 s, denoising about 431 s, and VAE decoding about 8.8 s. The previous v0.3.0 regression measured 1.75 s, 395.50 s, and 10.10 s respectively. The current engine also completed two 256x256 jobs with one load of each model component. A 10-job, 2-step check stayed near 4.24 GB peak Metal while continuing after one deliberate save failure. The new A/B used the same neutral synthetic prompt and seed 19780415 for both runs. Cache off took 367.35 s denoising with 20 transformer calls; experimental took 220.35 s with 12 calls, a 1.67× denoising speedup. Prompt encoding was about 0.3 s and VAE decoding about 4.9 s in both runs. The A/B PNGs had SSIM 0.964 and PSNR 32.78 dB; visual inspection found small detail changes but no new obvious structural failure. System-wide swap was already around 17 GB before A and did not rise during either run, so the swap observation cannot be compared directly with the original zero-swap benchmark. Performance and image quality depend on the Apple SoC, unified memory, prompt, resolution, step count, and dependency versions.
+For the original benchmark, prompt encoding took about 8.6 s, denoising about 431 s, and VAE decoding about 8.8 s. The previous v0.3.0 regression measured 1.75 s, 395.50 s, and 10.10 s respectively. The current engine also completed two 256x256 jobs with one load of each model component. A 10-job, 2-step check stayed near 4.24 GB peak Metal while continuing after one deliberate save failure. Performance and image quality depend on the Apple SoC, unified memory, prompt, resolution, step count, and dependency versions.
 
 ## How it works
 

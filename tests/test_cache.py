@@ -1,4 +1,4 @@
-"""Synthetic checks for isolated, fail-safe experimental noise reuse."""
+"""Synthetic checks for isolated, fail-safe balanced noise reuse."""
 
 import math
 import unittest

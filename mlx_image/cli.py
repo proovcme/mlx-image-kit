@@ -21,18 +21,24 @@ from mlx_image.types import Failure, Job, Result, Summary, validate_job
 
 MAX_SEED = 0xFFFFFFFF
 PRESETS = {"portrait": (768, 1152), "landscape": (1152, 768), "square": (1024, 1024)}
-CACHE_MODES = ("off", "experimental")
-CACHE_EXPERIMENTAL_THRESHOLD = 0.08
+CACHE_MODES = ("off", "balanced")
+BALANCED_CACHE_THRESHOLD = 0.08
 
 
 def _cache_config(mode: str):
     if mode == "off":
         return None
-    if mode != "experimental":
-        raise ValueError("cache must be off or experimental")
+    if mode != "balanced":
+        raise ValueError("cache must be off or balanced")
     from mlx_image.cache import CacheConfig
 
-    return CacheConfig(threshold=CACHE_EXPERIMENTAL_THRESHOLD)
+    return CacheConfig(threshold=BALANCED_CACHE_THRESHOLD)
+
+
+def _history_cache_mode(record: dict) -> str:
+    """Read pre-release local history without exposing its former mode name."""
+    mode = record.get("cache", "off")
+    return "balanced" if mode == "experimental" else mode
 
 
 def _run_jobs(*args, **kwargs) -> Summary:
@@ -231,7 +237,7 @@ class InteractiveSession:
         print(f"  steps      {record['steps']}")
         print(f"  seed       {record['seed']}")
         print(f"  guidance   {record['guidance']}")
-        print(f"  cache      {record.get('cache', 'off')}")
+        print(f"  cache      {_history_cache_mode(record)}")
         print(f"  output     {_display_path(Path(record['output']))}")
 
     def _show_history(self, records: list[dict]) -> None:
@@ -252,7 +258,7 @@ class InteractiveSession:
         if repeat:
             width, height = int(repeat["width"]), int(repeat["height"])
             steps, seed, guidance = int(repeat["steps"]), int(repeat["seed"]), float(repeat["guidance"])
-            cache_mode = repeat.get("cache", "off")
+            cache_mode = _history_cache_mode(repeat)
         else:
             s = self.settings
             width, height = s.width, s.height
@@ -261,7 +267,7 @@ class InteractiveSession:
         output = _unique_output(self.output_dir, self.reserved)
         job = Job(1, prompt, output, width, height, steps, seed, guidance, cache_mode)
         print(f"\n{'REPEAT' if repeat else 'GENERATE'}")
-        print(f"{width}×{height} · {steps} steps · seed {seed} · guidance {guidance}" + (f" · cache {cache_mode}" if cache_mode != "off" else ""))
+        print(f"{width}×{height} · {steps} steps · seed {seed} · guidance {guidance} · cache {cache_mode}")
         try:
             kwargs = {"model_path": self.model_path, "on_complete": self._record}
             if cache_mode != "off":
@@ -348,7 +354,7 @@ class InteractiveSession:
                 self.settings.cache = argument
                 print(f"✓ cache {argument}")
             elif name == "cache":
-                raise ValueError("cache must be off or experimental")
+                raise ValueError("cache must be off or balanced")
             elif name == "status" and not argument:
                 self.status()
             elif name == "last" and not argument:
@@ -400,7 +406,7 @@ class InteractiveSession:
                 print("  /steps N            inference steps")
                 print("  /seed N|random      fixed or random seed")
                 print("  /guidance X         guidance scale")
-                print("  /cache MODE         off or experimental noise reuse")
+                print("  /cache off|balanced choose denoising cache mode")
                 print("\nHistory")
                 print("  /last               last generation")
                 print("  /repeat             repeat last prompt and settings")
@@ -426,7 +432,7 @@ class InteractiveSession:
         s = self.settings
         print(f"MLX Image {_version()}")
         print("Qwen-Image 2.1 · MLX 4-bit")
-        print(f"\n  {s.width}×{s.height} · {s.steps} steps · seed random · guidance {s.guidance}")
+        print(f"\n  {s.width}×{s.height} · {s.steps} steps · seed random · guidance {s.guidance} · cache {s.cache}")
         print("\n  Type a prompt")
         print("  /paste multiline · /help commands · /quit exit\n")
         while True:
@@ -560,7 +566,7 @@ def batch_main(argv: list[str]) -> int:
         preset = next((name for name in PRESETS if getattr(args, name)), "landscape")
         default_width, default_height = PRESETS[preset]
     print("BATCH")
-    print(f"{len(jobs) + len(parse_failures)} jobs · {default_width}×{default_height} default · {args.steps} steps\n")
+    print(f"{len(jobs) + len(parse_failures)} jobs · {default_width}×{default_height} default · {args.steps} steps · cache {args.cache}\n")
     history = History()
 
     def record(result: Result) -> None:

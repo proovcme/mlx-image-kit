@@ -1,6 +1,6 @@
 """Conservative full-noise reuse gate for the Qwen-Image 2.1 denoising loop.
 
-This is an experimental output-change predictor, not a port of TeaCache's
+This is a project-specific output-change predictor, not a port of TeaCache's
 dual-stream residual cache or its old Qwen-Image coefficients.
 """
 

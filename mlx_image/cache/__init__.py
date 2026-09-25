@@ -1,4 +1,4 @@
-"""Optional, per-generation denoising cache experiments."""
+"""Optional, per-generation denoising cache."""
 
 from .noise_cache import CacheConfig, NoiseCache, relative_l1
 
