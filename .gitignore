@@ -1,6 +1,9 @@
 .venv/
 __pycache__/
 *.pyc
+*.egg-info/
+build/
+dist/
 .DS_Store
 .env
 .env.*
@@ -10,9 +13,14 @@ __pycache__/
 *.jpg
 *.jpeg
 *.webp
+*.npz
+*.jsonl
 outputs/
 output/
 generated/
 *.safetensors
 *.gguf
 *.bin
+.history/
+local/
+*.history.jsonl
