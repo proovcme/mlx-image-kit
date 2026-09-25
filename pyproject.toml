@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mlx-image-kit"
-version = "0.4.0"
+version = "0.5.0"
 description = "Local MLX image generation CLI for Apple Silicon"
 readme = "README.md"
 requires-python = ">=3.12"

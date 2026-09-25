@@ -115,6 +115,61 @@ class EngineLoopTests(unittest.TestCase):
         self.assertTrue(second_records[-1]["forward"])
         self.assertTrue(any(record["reuse"] for record in second_records))
 
+    def test_presentation_forward_events_match_cache_decisions_without_diagnostics(self):
+        class Scheduler:
+            sigmas = []
+
+            @staticmethod
+            def scale_model_input(latents, timestep):
+                return latents
+
+            @staticmethod
+            def step(*, noise, timestep, latents):
+                return latents + noise * 0.01
+
+        class FakeConfig:
+            width = height = 256
+            image_path = None
+            init_time_step = 0
+            num_inference_steps = 8
+            scheduler = Scheduler()
+
+            def __init__(self):
+                self._time_steps = None
+
+            @property
+            def time_steps(self):
+                if self._time_steps is None:
+                    raise AssertionError("library progress would be created")
+                return self._time_steps
+
+        forwards = []
+        steps = []
+        transformer_calls = []
+
+        def transformer(*, t, **kwargs):
+            transformer_calls.append(t)
+            return mx.array([0.1 + t * 0.01])
+
+        with (
+            patch.object(engine, "Config", return_value=FakeConfig()),
+            patch.object(engine, "Img2Img", return_value=None),
+            patch.object(engine.LatentCreator, "create_for_txt2img_or_img2img", return_value=mx.array([1.0])),
+        ):
+            engine._denoise(
+                self.job, transformer, mx.array([1.0]), mx.array([1.0]), object(),
+                on_step=lambda step, total: steps.append(step),
+                cache_config=CacheConfig(threshold=100.0),
+                show_library_progress=False,
+                on_forward=forwards.append,
+            )
+        self.assertEqual(steps, list(range(1, 9)))
+        self.assertEqual(len(forwards), 8)
+        self.assertEqual(sum(forwards), len(transformer_calls))
+        self.assertTrue(forwards[0])
+        self.assertTrue(forwards[-1])
+        self.assertIn(False, forwards)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -189,14 +189,14 @@ class InteractiveTests(unittest.TestCase):
             self.assertEqual(observed[0][0].cache_mode, "off")
             self.assertNotIn("cache_config", observed[0][1])
             self.assertIn("cache      off", output.getvalue())
-            self.assertIn("· cache off", output.getvalue())
+            self.assertIn("MLX Q4 · off", output.getvalue())
 
     def test_cache_command_status_history_and_repeat(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             observed = []
 
-            def runner(jobs, *, model_path=None, on_complete=None, cache_config=None):
+            def runner(jobs, *, model_path=None, on_complete=None, cache_config=None, **kwargs):
                 observed.append((jobs[0], cache_config))
                 result = Result(jobs[0], "2026-09-24T12:00:00+03:00", 1.0, 4.2)
                 if on_complete:
@@ -221,7 +221,7 @@ class InteractiveTests(unittest.TestCase):
             self.assertIn("✓ cache off", output.getvalue())
             self.assertIn("✗ cache must be off or balanced", output.getvalue())
             self.assertIn("/cache off|balanced", output.getvalue())
-            self.assertIn("· cache balanced", output.getvalue())
+            self.assertIn("MLX Q4 · balanced", output.getvalue())
             self.assertNotIn("experimental", output.getvalue())
             self.assertNotIn(PROMPT, output.getvalue())
 
@@ -243,7 +243,7 @@ class InteractiveTests(unittest.TestCase):
 
             observed = []
 
-            def runner(batch_jobs, *, model_path=None, on_complete=None, cache_config=None):
+            def runner(batch_jobs, *, model_path=None, on_complete=None, cache_config=None, **kwargs):
                 observed.append((batch_jobs, cache_config))
                 return Summary(len(batch_jobs))
 
@@ -254,7 +254,7 @@ class InteractiveTests(unittest.TestCase):
 
             direct = []
 
-            def direct_runner(direct_jobs, *, model_path=None, cache_config=None):
+            def direct_runner(direct_jobs, *, model_path=None, cache_config=None, **kwargs):
                 direct.append((direct_jobs[0], cache_config))
                 return Summary(1, completed=[Result(direct_jobs[0], "2026-09-24T12:00:00+03:00", 1.0, 4.2)])
 
@@ -266,7 +266,7 @@ class InteractiveTests(unittest.TestCase):
                 self.assertEqual(generate.main(), 0)
             self.assertEqual(direct[0][0].cache_mode, "balanced")
             self.assertEqual(direct[0][1].threshold, 0.08)
-            self.assertIn("GENERATE\n1024×1024 · 20 steps · seed 42 · guidance 1.0 · cache balanced", direct_output.getvalue())
+            self.assertIn("Qwen-Image 2.1 · MLX Q4 · balanced", direct_output.getvalue())
 
             for cache_arg in ([], ["--cache", "off"]):
                 with (
@@ -292,7 +292,7 @@ class InteractiveTests(unittest.TestCase):
             ]
             expected = "\n".join(lines)
 
-            def runner(jobs, *, model_path=None, on_complete=None):
+            def runner(jobs, *, model_path=None, on_complete=None, **kwargs):
                 generated.extend(jobs)
                 result = Result(jobs[0], "2026-09-24T12:00:00+03:00", 1.0, 4.2)
                 if on_complete:
@@ -312,13 +312,13 @@ class InteractiveTests(unittest.TestCase):
                 history=History(root / ".history" / "history.jsonl"),
                 runner=runner,
             )
-            with patch("builtins.input", side_effect=read_input), patch("mlx_image.cli._version", return_value="0.4.0"), contextlib.redirect_stdout(io.StringIO()) as output:
+            with patch("builtins.input", side_effect=read_input), patch("mlx_image.cli._version", return_value="0.5.0"), contextlib.redirect_stdout(io.StringIO()) as output:
                 self.assertEqual(session.run(), 0)
 
             self.assertEqual(len(generated), 1)
             self.assertEqual(generated[0].prompt, expected)
             self.assertEqual(session.history.read()[0]["prompt"], expected)
-            self.assertIn("MLX Image 0.4.0", output.getvalue())
+            self.assertIn("MLX Image 0.5.0", output.getvalue())
             self.assertIn("  /paste multiline · /help commands · /quit exit", output.getvalue())
             self.assertIn("MULTILINE PROMPT\nPaste your prompt below.\nFinish with /end · cancel with /cancel", output.getvalue())
             self.assertNotIn(expected, output.getvalue())
@@ -328,7 +328,7 @@ class InteractiveTests(unittest.TestCase):
             root = Path(directory)
             generated = []
 
-            def runner(jobs, *, model_path=None, on_complete=None):
+            def runner(jobs, *, model_path=None, on_complete=None, **kwargs):
                 generated.extend(jobs)
                 result = Result(jobs[0], "2026-09-24T12:00:00+03:00", 1.0, 4.2)
                 if on_complete:
@@ -358,7 +358,7 @@ class InteractiveTests(unittest.TestCase):
             generated = []
             opened = []
 
-            def runner(jobs, *, model_path=None, on_complete=None):
+            def runner(jobs, *, model_path=None, on_complete=None, **kwargs):
                 job = jobs[0]
                 generated.append(job)
                 job.output.parent.mkdir(parents=True, exist_ok=True)
@@ -394,7 +394,7 @@ class InteractiveTests(unittest.TestCase):
 
 class InteractiveUxTests(unittest.TestCase):
     def make_session(self, root, generated, *, model_path=None):
-        def runner(jobs, *, model_path=None, on_complete=None):
+        def runner(jobs, *, model_path=None, on_complete=None, **kwargs):
             generated.extend(jobs)
             result = Result(jobs[0], "2026-09-24T12:00:00+03:00", 1.0, 4.2)
             if on_complete:
@@ -413,13 +413,13 @@ class InteractiveUxTests(unittest.TestCase):
             generated = []
             session = self.make_session(Path(directory), generated, model_path=Path("/synthetic/model"))
             with (
-                patch("mlx_image.cli._version", return_value="0.4.0"),
+                patch("mlx_image.cli._version", return_value="0.5.0"),
                 patch("builtins.input", side_effect=["/help", "/status", "/quit"]) as read_input,
                 contextlib.redirect_stdout(io.StringIO()) as output,
             ):
                 self.assertEqual(session.run(), 0)
             screen = output.getvalue()
-            self.assertIn("MLX Image 0.4.0\nQwen-Image 2.1 · MLX 4-bit", screen)
+            self.assertIn("MLX Image 0.5.0\nQwen-Image 2.1 · MLX 4-bit", screen)
             self.assertIn("1152×768 · 20 steps · seed random · guidance 1.0", screen)
             for heading in ("Prompt", "Image", "Generation", "History", "Other"):
                 self.assertIn(heading, screen)
@@ -497,7 +497,7 @@ class InteractiveUxTests(unittest.TestCase):
             self.assertIn("✗ last image no longer exists", screen)
             self.assertIn("Last generation", screen)
             self.assertIn("#  time", screen)
-            self.assertIn("REPEAT\n256×256 · 3 steps · seed 1977 · guidance 1.5 · cache off", screen)
+            self.assertIn("256×256 · 3 steps · seed 1977 · guidance 1.5", screen)
             self.assertNotIn(PROMPT, screen)
 
     def test_interrupt_during_generation_exits_interactive_safely(self):
@@ -510,7 +510,7 @@ class InteractiveUxTests(unittest.TestCase):
             with patch("builtins.input", return_value=PROMPT), contextlib.redirect_stdout(io.StringIO()) as output:
                 self.assertEqual(session.run(), 130)
             self.assertEqual(session.history.read(), [])
-            self.assertIn("Generation interrupted; leaving interactive mode", output.getvalue())
+            self.assertIn("Generation interrupted.", output.getvalue())
 
 
 class BatchUxTests(unittest.TestCase):
@@ -522,7 +522,7 @@ class BatchUxTests(unittest.TestCase):
             history = History(root / ".history" / "history.jsonl")
             observed = []
 
-            def runner(jobs, *, model_path=None, on_complete=None):
+            def runner(jobs, *, model_path=None, on_complete=None, **kwargs):
                 observed.extend(jobs)
                 result = Result(jobs[0], "2026-09-24T12:00:00+03:00", 1.0, 4.2)
                 if on_complete:
@@ -532,7 +532,7 @@ class BatchUxTests(unittest.TestCase):
             with patch("mlx_image.cli._run_jobs", side_effect=runner), patch("mlx_image.cli.History", return_value=history), contextlib.redirect_stdout(io.StringIO()) as output:
                 self.assertEqual(batch_main([str(source), "--output-dir", str(root / "outputs")]), 0)
             screen = output.getvalue()
-            self.assertIn("BATCH\n1 jobs · 1152×768 default · 20 steps · cache off", screen)
+            self.assertIn("MLX Image 0.5.0 · BATCH\n1 images · 1152×768 · 20 steps · cache off", screen)
             self.assertIn("Completed  1", screen)
             self.assertIn("Failed     0", screen)
             self.assertIn("Peak Metal 4.20 GB", screen)

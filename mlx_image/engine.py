@@ -166,6 +166,8 @@ def _denoise(
     on_step: Callable[[int, int], None] | None = None,
     on_diagnostic: Callable[[dict], None] | None = None,
     cache_config: CacheConfig | None = None,
+    show_library_progress: bool = True,
+    on_forward: Callable[[bool], None] | None = None,
 ):
     config = Config(
         width=job.width,
@@ -189,6 +191,10 @@ def _denoise(
         ),
     ).astype(ModelConfig.precision)
     mx.eval(latents)
+    if not show_library_progress:
+        # mflux wraps this exact range in tqdm. Preserve the timesteps while
+        # leaving terminal progress to the caller's single presenter.
+        config._time_steps = range(config.init_time_step, config.num_inference_steps)
     if cache_config is None and on_diagnostic is None:
         # Keep the v0.3.0 loop intact when cache and diagnostics are off.
         for step, t in enumerate(config.time_steps, 1):
@@ -237,6 +243,8 @@ def _denoise(
                 output_metric = cache.observe_forward(latents_scaled, noise)
             else:
                 output_metric = relative_l1(noise, previous_noise) if previous_noise is not None else None
+        if on_forward:
+            on_forward(not reuse)
         if on_diagnostic is not None:
             on_diagnostic({
                 "step": step,
@@ -275,8 +283,12 @@ def run_jobs(
     on_failure: Callable[[Failure], None] | None = None,
     on_denoise_diagnostic: Callable[[int, dict], None] | None = None,
     on_stage_timing: Callable[[int, str, float], None] | None = None,
+    on_stage_event: Callable[[str, int | None], None] | None = None,
+    on_step: Callable[[int, int, int], None] | None = None,
+    on_forward: Callable[[int, bool], None] | None = None,
     cache_config: CacheConfig | None = None,
     progress: bool = True,
+    show_library_progress: bool = True,
 ) -> Summary:
     """Run sequential jobs with one load of each heavy model and disk-spilled intermediates."""
     summary = Summary(total=len(jobs))
@@ -284,7 +296,15 @@ def run_jobs(
     states: list[_StageState] = []
 
     def fail(index: int, stage: str, exc: Exception) -> None:
-        failure = Failure(index, f"{stage}: {type(exc).__name__}")
+        if stage == "validation" and isinstance(exc, ValueError):
+            message = str(exc)
+        elif stage == "model setup" and isinstance(exc, FileNotFoundError):
+            message = "model snapshot not found or incomplete"
+        elif stage == "VAE or save" and isinstance(exc, PermissionError):
+            message = "output directory is not writable"
+        else:
+            message = f"{stage}: {type(exc).__name__}"
+        failure = Failure(index, message)
         summary.failed.append(failure)
         if on_failure:
             on_failure(failure)
@@ -308,12 +328,16 @@ def run_jobs(
         stage = "model setup"
         try:
             snapshot = _snapshot(model_path)
+            if on_stage_event:
+                on_stage_event("model_ready", None)
             model_config = ModelConfig.qwen_image_21()
 
             stage = "text encoder"
             if progress:
                 print("Loading text encoder...")
             te = _load_text_encoder(snapshot)
+            if on_stage_event:
+                on_stage_event("text_encoder_ready", None)
             qwen = QwenImage21.__new__(QwenImage21)
             super(QwenImage21, qwen).__init__()
             Qwen21Initializer._init_config(qwen, model_config)
@@ -334,6 +358,8 @@ def run_jobs(
                         mx.eval(embeds, mask)
                         if on_stage_timing:
                             on_stage_timing(state.job.index, "prompt_encoding", time.monotonic() - began)
+                        if on_stage_event:
+                            on_stage_event("prompt_encoded", state.job.index)
                         mx.savez(str(state.embeds_path), embeds=embeds, mask=mask)
                         state.compute_seconds += time.monotonic() - began
                         if progress:
@@ -358,6 +384,8 @@ def run_jobs(
             if progress:
                 print("Loading transformer...")
             tr = _load_transformer(snapshot)
+            if on_stage_event:
+                on_stage_event("transformer_ready", None)
             if progress:
                 print("Denoising")
             try:
@@ -370,6 +398,10 @@ def run_jobs(
                         data = mx.load(str(state.embeds_path))
 
                         def show_step(step: int, total: int) -> None:
+                            if on_step:
+                                on_step(state.job.index, step, total)
+                            if not progress:
+                                return
                             filled = round(20 * step / total)
                             bar = "█" * filled + "░" * (20 - filled)
                             line = f"  [{position:02d}/{len(states):02d}] [{bar}] {step}/{total}"
@@ -379,14 +411,20 @@ def run_jobs(
                                 print(line)
 
                         began_denoise = time.monotonic()
+                        if on_stage_event:
+                            on_stage_event("denoising_start", state.job.index)
+                        progress_options = {} if show_library_progress else {"show_library_progress": False}
                         if on_denoise_diagnostic is None and cache_config is None:
-                            latents = _denoise(state.job, tr, data["embeds"], data["mask"], model_config, show_step if progress else None)
+                            latents = _denoise(state.job, tr, data["embeds"], data["mask"], model_config, show_step if progress or on_step else None,
+                                               **progress_options)
                         else:
                             latents = _denoise(
                                 state.job, tr, data["embeds"], data["mask"], model_config,
-                                show_step if progress else None,
+                                show_step if progress or on_step else None,
                                 (lambda record: on_denoise_diagnostic(state.job.index, record)) if on_denoise_diagnostic else None,
                                 cache_config,
+                                **progress_options,
+                                on_forward=(lambda forward: on_forward(state.job.index, forward)) if on_forward else None,
                             )
                         if on_stage_timing:
                             on_stage_timing(state.job.index, "denoising", time.monotonic() - began_denoise)
@@ -411,6 +449,8 @@ def run_jobs(
             if progress:
                 print("Loading VAE...")
             vae = _load_vae(snapshot)
+            if on_stage_event:
+                on_stage_event("vae_ready", None)
             if progress:
                 print("Decoding")
             try:
@@ -425,6 +465,8 @@ def run_jobs(
                             latents=data["latents"], height=state.job.height, width=state.job.width
                         )
                         began_decode = time.monotonic()
+                        if on_stage_event:
+                            on_stage_event("decoding_start", state.job.index)
                         decoded = VAEUtil.decode(vae=vae, latent=unpacked, tiling_config=None)
                         mx.eval(decoded)
                         if on_stage_timing:

@@ -94,6 +94,8 @@ python generate.py \
 
 Omit `--cache` for vanilla generation. `--cache off` is also accepted. Use `--model-path PATH` for an existing local snapshot.
 
+The terminal shows one denoising progress indicator and a measured summary when the PNG is saved. `--quiet` prints only saved PNG paths on stdout; errors go to stderr. `--verbose` shows the model source and loader details. Redirected output uses a few plain progress lines rather than terminal animation.
+
 ### Sequential batch
 
 A `.txt` file contains one prompt per nonempty line. A `.jsonl` file can also set `output`, `width`, `height`, `steps`, `seed`, and `guidance` for each job:
@@ -109,6 +111,8 @@ mlx-image batch local/jobs.jsonl --cache balanced --output-dir outputs/
 ```
 
 The batch-wide cache mode defaults to `off`. `--count N` makes N variations per prompt; a fixed seed increments for each variation. Batch jobs run sequentially, reuse the loaded transformer, and each gets fresh cache state. A failed job is reported by number without printing its prompt. Run `mlx-image batch --help` for all flags.
+
+For shell automation, batch `--quiet` prints one saved PNG path per line on stdout; failures are reported on stderr. Batch `--verbose` shows model source and loader details.
 
 ## Why the native Q4 loader matters
 

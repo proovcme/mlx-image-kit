@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """Direct, script-friendly image generation using the shared staged MLX engine."""
 
-import argparse
+import sys
+import traceback
 from pathlib import Path
 
-from mlx_image.types import Job
+from mlx_image.types import Job, validate_job
+from mlx_image.presentation import FriendlyArgumentParser
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Generate an image locally with MLX")
+def parse_args(argv=None):
+    parser = FriendlyArgumentParser(description="Generate an image locally with MLX")
     parser.add_argument("--prompt", type=str, required=True, help="Text prompt for image generation")
     parser.add_argument("--output", type=str, default="output.png", help="Output PNG path (default: output.png)")
     parser.add_argument("--width", type=int, default=1024, help="Image width in pixels (default: 1024)")
@@ -18,12 +20,16 @@ def parse_args():
     parser.add_argument("--guidance", type=float, default=1.0, help="Guidance scale (default: 1.0)")
     parser.add_argument("--cache", choices=("off", "balanced"), default="off", help="Denoising cache mode (default: off)")
     parser.add_argument("--model-path", type=Path, help="Local model snapshot directory; otherwise use the Hugging Face cache")
-    return parser.parse_args()
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--quiet", action="store_true", help="Print only the output path on success")
+    modes.add_argument("--verbose", action="store_true", help="Show diagnostic details")
+    return parser.parse_args(argv)
 
 
 def main() -> int:
     args = parse_args()
     from mlx_image.engine import run_jobs
+    from mlx_image.presentation import report_failure, run_presented
 
     job = Job(
         index=1,
@@ -36,24 +42,35 @@ def main() -> int:
         guidance=args.guidance,
         cache_mode=args.cache,
     )
-    kwargs = {"model_path": args.model_path}
+    try:
+        validate_job(job)
+    except ValueError as exc:
+        print(f"✗ {exc}", file=sys.stderr)
+        return 2
+    cache_config = None
     if args.cache != "off":
         from mlx_image.cli import _cache_config
 
-        kwargs["cache_config"] = _cache_config(args.cache)
-    print("GENERATE")
-    print(f"{job.width}×{job.height} · {job.steps} steps · seed {job.seed} · guidance {job.guidance} · cache {job.cache_mode}")
-    summary = run_jobs([job], **kwargs)
+        cache_config = _cache_config(args.cache)
+    mode = "quiet" if args.quiet else "verbose" if args.verbose else "normal"
+    try:
+        summary = run_presented(run_jobs, [job], model_path=args.model_path, cache_config=cache_config, mode=mode)
+    except KeyboardInterrupt:
+        print("\nGeneration interrupted.", file=sys.stderr)
+        return 130
+    except Exception as exc:
+        if args.verbose:
+            traceback.print_exc()
+        else:
+            print(f"✗ generation failed: {type(exc).__name__}", file=sys.stderr)
+        return 1
     if summary.completed:
-        result = summary.completed[0]
-        print(f"Saved: {result.job.output}")
-        print(f"Elapsed: {summary.elapsed_seconds:.2f} s | Seed: {result.job.seed} | Peak Metal: {result.peak_metal_gb:.2f} GB")
         return 0
     if summary.interrupted:
-        print("Generation interrupted")
+        print("\nGeneration interrupted.", file=sys.stderr)
         return 130
     for failure in summary.failed:
-        print(f"Generation failed: {failure.message}")
+        report_failure(failure)
     return 1
 
 

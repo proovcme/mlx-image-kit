@@ -10,7 +10,6 @@ import secrets
 import subprocess
 import sys
 import tempfile
-import time
 from dataclasses import dataclass
 from datetime import datetime
 from importlib.metadata import PackageNotFoundError, version
@@ -18,6 +17,7 @@ from pathlib import Path
 from typing import Callable
 
 from mlx_image.types import Failure, Job, Result, Summary, validate_job
+from mlx_image.presentation import FriendlyArgumentParser, report_failure, run_presented
 
 MAX_SEED = 0xFFFFFFFF
 PRESETS = {"portrait": (768, 1152), "landscape": (1152, 768), "square": (1024, 1024)}
@@ -87,12 +87,6 @@ def _display_path(path: Path) -> str:
         return f"./{relative}"
     except ValueError:
         return str(path)
-
-
-def _peak_line(value: float) -> str | None:
-    if math.isfinite(value) and value > 0:
-        return f"  peak Metal {value:.2f} GB"
-    return None
 
 
 def _positive_int(value: str) -> int:
@@ -195,6 +189,7 @@ class InteractiveSession:
         history: History | None = None,
         runner: Callable | None = None,
         opener: Callable = subprocess.run,
+        verbose: bool = False,
     ):
         self.model_path = model_path
         self.output_dir = output_dir or Path.cwd() / "outputs"
@@ -202,6 +197,7 @@ class InteractiveSession:
         self.settings = Settings()
         self.runner = runner or _run_jobs
         self.opener = opener
+        self.verbose = verbose
         self.reserved: set[Path] = set()
         self._paste_lines: list[str] | None = None
         self._interrupted = False
@@ -266,13 +262,11 @@ class InteractiveSession:
             cache_mode = s.cache
         output = _unique_output(self.output_dir, self.reserved)
         job = Job(1, prompt, output, width, height, steps, seed, guidance, cache_mode)
-        print(f"\n{'REPEAT' if repeat else 'GENERATE'}")
-        print(f"{width}×{height} · {steps} steps · seed {seed} · guidance {guidance} · cache {cache_mode}")
         try:
-            kwargs = {"model_path": self.model_path, "on_complete": self._record}
-            if cache_mode != "off":
-                kwargs["cache_config"] = _cache_config(cache_mode)
-            summary = self.runner([job], **kwargs)
+            summary = run_presented(
+                self.runner, [job], model_path=self.model_path, on_complete=self._record,
+                cache_config=_cache_config(cache_mode), mode="verbose" if self.verbose else "normal",
+            )
         except KeyboardInterrupt:
             summary = Summary(1, interrupted=True)
         except Exception as exc:
@@ -282,20 +276,11 @@ class InteractiveSession:
             self.history.ensure(summary.completed)
         except (OSError, ValueError):
             print("Local history could not be saved")
-        if summary.completed:
-            result = summary.completed[0]
-            print(f"✓ Saved  {_display_path(result.job.output)}")
-            print(f"  {summary.elapsed_seconds:.1f} s · seed {seed}")
-            peak = _peak_line(result.peak_metal_gb)
-            if peak:
-                print(peak)
-            if summary.interrupted:
-                print("Generation interrupted; leaving interactive mode")
-        elif summary.interrupted:
-            print("Generation interrupted; leaving interactive mode")
+        if summary.interrupted:
+            print("Generation interrupted.")
         else:
             for failure in summary.failed:
-                print(f"✗ generation failed: {failure.message}")
+                report_failure(failure)
         return summary
 
     def handle(self, line: str) -> bool:
@@ -458,7 +443,7 @@ class InteractiveSession:
 
 
 def _batch_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="mlx-image batch", description="Sequential staged generation from TXT or JSONL")
+    parser = FriendlyArgumentParser(prog="mlx-image batch", description="Sequential staged generation from TXT or JSONL")
     parser.add_argument("file", type=Path, help="TXT (one prompt per line) or JSONL job file")
     preset = parser.add_mutually_exclusive_group()
     for name in PRESETS:
@@ -471,6 +456,9 @@ def _batch_parser() -> argparse.ArgumentParser:
     parser.add_argument("--count", type=_positive_int, default=1, help="Images per prompt")
     parser.add_argument("--output-dir", type=Path, default=Path("outputs"))
     parser.add_argument("--model-path", type=Path, help="Local model snapshot directory")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--quiet", action="store_true", help="Print only saved output paths")
+    modes.add_argument("--verbose", action="store_true", help="Show diagnostic details")
     return parser
 
 
@@ -539,61 +527,61 @@ def parse_batch_jobs(args: argparse.Namespace) -> tuple[list[Job], list[Failure]
 def batch_main(argv: list[str]) -> int:
     parser = _batch_parser()
     args = parser.parse_args(argv)
-    began = time.monotonic()
+    mode = "quiet" if args.quiet else "verbose" if args.verbose else "normal"
     try:
         jobs, parse_failures = parse_batch_jobs(args)
     except FileNotFoundError:
-        print("✗ input file not found")
+        print("✗ input file not found", file=sys.stderr)
         return 2
     except PermissionError:
-        print("✗ input file cannot be read")
+        print("✗ input file cannot be read", file=sys.stderr)
         return 2
     except UnicodeError:
-        print("✗ input file must be UTF-8 text")
+        print("✗ input file must be UTF-8 text", file=sys.stderr)
         return 2
     except ValueError as exc:
-        print(f"✗ {exc}")
+        print(f"✗ {exc}", file=sys.stderr)
         return 2
     except OSError:
-        print("✗ input file cannot be read")
+        print("✗ input file cannot be read", file=sys.stderr)
         return 2
     if not jobs and not parse_failures:
-        print("✗ no jobs in input")
+        print("✗ no jobs in input", file=sys.stderr)
         return 2
-    if args.size:
-        default_width, default_height = _size(args.size)
-    else:
-        preset = next((name for name in PRESETS if getattr(args, name)), "landscape")
-        default_width, default_height = PRESETS[preset]
-    print("BATCH")
-    print(f"{len(jobs) + len(parse_failures)} jobs · {default_width}×{default_height} default · {args.steps} steps · cache {args.cache}\n")
     history = History()
 
     def record(result: Result) -> None:
         try:
             history.append(result)
         except (OSError, ValueError):
-            print(f"✗ job {result.job.index}: local history could not be saved")
+            print(f"✗ job {result.job.index}: local history could not be saved", file=sys.stderr)
 
-    kwargs = {"model_path": args.model_path, "on_complete": record}
-    if args.cache != "off":
-        kwargs["cache_config"] = _cache_config(args.cache)
-    summary = _run_jobs(jobs, **kwargs) if jobs else Summary(total=0)
+    try:
+        summary = run_presented(
+            _run_jobs, jobs, model_path=args.model_path, on_complete=record,
+            cache_config=_cache_config(args.cache), mode=mode, batch=True,
+            extra_failures=parse_failures,
+        ) if jobs else Summary(total=0)
+    except KeyboardInterrupt:
+        print("\nGeneration interrupted.", file=sys.stderr)
+        return 130
+    except Exception as exc:
+        if args.verbose:
+            import traceback
+
+            traceback.print_exc()
+        else:
+            print(f"✗ batch failed: {type(exc).__name__}", file=sys.stderr)
+        return 1
     try:
         history.ensure(summary.completed)
     except (OSError, ValueError):
-        print("✗ local history could not be saved")
+        print("✗ local history could not be saved", file=sys.stderr)
     all_failures = parse_failures + summary.failed
     for failure in all_failures:
-        print(f"✗ job {failure.index}: {failure.message}")
-    print(f"\nCompleted  {len(summary.completed)}")
-    print(f"Failed     {len(all_failures)}")
-    print(f"Elapsed    {time.monotonic() - began:.1f} s")
-    peaks = [result.peak_metal_gb for result in summary.completed if math.isfinite(result.peak_metal_gb) and result.peak_metal_gb > 0]
-    if peaks:
-        print(f"Peak Metal {max(peaks):.2f} GB")
+        print(f"✗ job {failure.index}: {failure.message}", file=sys.stderr)
     if summary.interrupted:
-        print("Batch interrupted; completed PNGs and history are retained")
+        print("Batch interrupted; completed PNGs and history are retained", file=sys.stderr)
         return 130
     return 1 if all_failures else 0
 
@@ -608,7 +596,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--model-path", type=Path, help="Local model snapshot directory")
     parser.add_argument("--output-dir", type=Path, default=Path("outputs"))
     parser.add_argument("--cache", choices=CACHE_MODES, default="off", help="Initial cache mode (default: off)")
+    parser.add_argument("--verbose", action="store_true", help="Show diagnostic details during generation")
     args = parser.parse_args(argv)
-    session = InteractiveSession(model_path=args.model_path, output_dir=args.output_dir)
+    session = InteractiveSession(model_path=args.model_path, output_dir=args.output_dir, verbose=args.verbose)
     session.settings.cache = args.cache
     return session.run()
