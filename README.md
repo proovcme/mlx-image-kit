@@ -120,17 +120,7 @@ The working path in [`mlx_image/engine.py`](mlx_image/engine.py) loads the local
 | Transformer | Create native Q4 `Qwen21Transformer` with group size 64; remap `modulation.0.*` to `modulation.layers.1.*` and `time_text_embed.linear_*` to `time_text_embed.timestep_embedder.linear_*`; load with `strict=True`. The tested local snapshot needs 3 + 6 such key remaps. |
 | VAE | Map `.gamma`/`.beta` and convolution paths, then select only keys with matching target shapes. The VAE retains the working prototype's `strict=False` update behavior. |
 
-Execution is staged: encode prompts and release the text encoder; load the transformer, denoise and release it; load the VAE, decode and save PNGs. Batch mode spills intermediate arrays to a temporary directory and loads each heavy component once. Loader behavior is covered by [`tests/test_loader.py`](tests/test_loader.py) without downloading weights.
-
-## Local data and output
-
-Generated PNGs, model weights, diagnostic files, `local/`, and `.history/` are ignored by Git. The CLI stores completed prompt history locally for `/repeat`; history is never included in this repository. The six curated images under `assets/` are the only generated images intended for the public README. Their PNG metadata is empty; no source prompt or private output path is included.
-
-Run the model-free CLI, cache, and loader regression tests with:
-
-```sh
-python -m unittest discover -s tests -q
-```
+Execution is staged: encode prompts and release the text encoder; load the transformer, denoise and release it; load the VAE, decode and save PNGs. Batch mode spills intermediate arrays to a temporary directory and loads each heavy component once.
 
 ## Model and license
 
