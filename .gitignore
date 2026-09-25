@@ -10,6 +10,12 @@ dist/
 .cache/
 *.log
 *.png
+!assets/showcase.png
+!assets/gallery/woodblock.png
+!assets/gallery/comic.png
+!assets/gallery/isometric.png
+!assets/gallery/exploded-view.png
+!assets/gallery/poster.png
 *.jpg
 *.jpeg
 *.webp
