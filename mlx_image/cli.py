@@ -21,6 +21,18 @@ from mlx_image.types import Failure, Job, Result, Summary, validate_job
 
 MAX_SEED = 0xFFFFFFFF
 PRESETS = {"portrait": (768, 1152), "landscape": (1152, 768), "square": (1024, 1024)}
+CACHE_MODES = ("off", "experimental")
+CACHE_EXPERIMENTAL_THRESHOLD = 0.08
+
+
+def _cache_config(mode: str):
+    if mode == "off":
+        return None
+    if mode != "experimental":
+        raise ValueError("cache must be off or experimental")
+    from mlx_image.cache import CacheConfig
+
+    return CacheConfig(threshold=CACHE_EXPERIMENTAL_THRESHOLD)
 
 
 def _run_jobs(*args, **kwargs) -> Summary:
@@ -126,6 +138,7 @@ class History:
             "steps": result.job.steps,
             "seed": result.job.seed,
             "guidance": result.job.guidance,
+            "cache": result.job.cache_mode,
             "elapsed_seconds": round(result.elapsed_seconds, 3),
             "peak_metal_gb": round(result.peak_metal_gb, 3),
         }
@@ -164,6 +177,7 @@ class Settings:
     steps: int = 20
     seed: int | None = None
     guidance: float = 1.0
+    cache: str = "off"
 
 
 class InteractiveSession:
@@ -193,6 +207,7 @@ class InteractiveSession:
         print(f"  steps      {s.steps}")
         print(f"  seed       {s.seed if s.seed is not None else 'random'}")
         print(f"  guidance   {s.guidance}")
+        print(f"  cache      {s.cache}")
         print("\nModel")
         print("  model      Qwen-Image 2.1")
         print("  precision  4-bit")
@@ -216,6 +231,7 @@ class InteractiveSession:
         print(f"  steps      {record['steps']}")
         print(f"  seed       {record['seed']}")
         print(f"  guidance   {record['guidance']}")
+        print(f"  cache      {record.get('cache', 'off')}")
         print(f"  output     {_display_path(Path(record['output']))}")
 
     def _show_history(self, records: list[dict]) -> None:
@@ -236,16 +252,21 @@ class InteractiveSession:
         if repeat:
             width, height = int(repeat["width"]), int(repeat["height"])
             steps, seed, guidance = int(repeat["steps"]), int(repeat["seed"]), float(repeat["guidance"])
+            cache_mode = repeat.get("cache", "off")
         else:
             s = self.settings
             width, height = s.width, s.height
             steps, seed, guidance = s.steps, _actual_seed(s.seed), s.guidance
+            cache_mode = s.cache
         output = _unique_output(self.output_dir, self.reserved)
-        job = Job(1, prompt, output, width, height, steps, seed, guidance)
+        job = Job(1, prompt, output, width, height, steps, seed, guidance, cache_mode)
         print(f"\n{'REPEAT' if repeat else 'GENERATE'}")
-        print(f"{width}×{height} · {steps} steps · seed {seed} · guidance {guidance}")
+        print(f"{width}×{height} · {steps} steps · seed {seed} · guidance {guidance}" + (f" · cache {cache_mode}" if cache_mode != "off" else ""))
         try:
-            summary = self.runner([job], model_path=self.model_path, on_complete=self._record)
+            kwargs = {"model_path": self.model_path, "on_complete": self._record}
+            if cache_mode != "off":
+                kwargs["cache_config"] = _cache_config(cache_mode)
+            summary = self.runner([job], **kwargs)
         except KeyboardInterrupt:
             summary = Summary(1, interrupted=True)
         except Exception as exc:
@@ -323,6 +344,11 @@ class InteractiveSession:
                     raise ValueError("guidance must be greater than 0")
                 self.settings.guidance = value
                 print(f"✓ guidance {value}")
+            elif name == "cache" and argument in CACHE_MODES:
+                self.settings.cache = argument
+                print(f"✓ cache {argument}")
+            elif name == "cache":
+                raise ValueError("cache must be off or experimental")
             elif name == "status" and not argument:
                 self.status()
             elif name == "last" and not argument:
@@ -374,6 +400,7 @@ class InteractiveSession:
                 print("  /steps N            inference steps")
                 print("  /seed N|random      fixed or random seed")
                 print("  /guidance X         guidance scale")
+                print("  /cache MODE         off or experimental noise reuse")
                 print("\nHistory")
                 print("  /last               last generation")
                 print("  /repeat             repeat last prompt and settings")
@@ -434,6 +461,7 @@ def _batch_parser() -> argparse.ArgumentParser:
     parser.add_argument("--steps", type=_positive_int, default=20)
     parser.add_argument("--seed", default="random", help="Integer or random")
     parser.add_argument("--guidance", type=float, default=1.0)
+    parser.add_argument("--cache", choices=CACHE_MODES, default="off")
     parser.add_argument("--count", type=_positive_int, default=1, help="Images per prompt")
     parser.add_argument("--output-dir", type=Path, default=Path("outputs"))
     parser.add_argument("--model-path", type=Path, help="Local model snapshot directory")
@@ -493,7 +521,7 @@ def parse_batch_jobs(args: argparse.Namespace) -> tuple[list[Job], list[Failure]
                     while actual_seed in used_seeds:
                         actual_seed = _actual_seed(None)
                 used_seeds.add(actual_seed)
-                job = Job(next_index, prompt, output, width, height, steps, actual_seed, guidance)
+                job = Job(next_index, prompt, output, width, height, steps, actual_seed, guidance, args.cache)
                 jobs.append(job)
                 next_index += 1
         except (TypeError, ValueError, OverflowError):
@@ -541,7 +569,10 @@ def batch_main(argv: list[str]) -> int:
         except (OSError, ValueError):
             print(f"✗ job {result.job.index}: local history could not be saved")
 
-    summary = _run_jobs(jobs, model_path=args.model_path, on_complete=record) if jobs else Summary(total=0)
+    kwargs = {"model_path": args.model_path, "on_complete": record}
+    if args.cache != "off":
+        kwargs["cache_config"] = _cache_config(args.cache)
+    summary = _run_jobs(jobs, **kwargs) if jobs else Summary(total=0)
     try:
         history.ensure(summary.completed)
     except (OSError, ValueError):
@@ -570,5 +601,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--model-path", type=Path, help="Local model snapshot directory")
     parser.add_argument("--output-dir", type=Path, default=Path("outputs"))
+    parser.add_argument("--cache", choices=CACHE_MODES, default="off", help="Initial cache mode (default: off)")
     args = parser.parse_args(argv)
-    return InteractiveSession(model_path=args.model_path, output_dir=args.output_dir).run()
+    session = InteractiveSession(model_path=args.model_path, output_dir=args.output_dir)
+    session.settings.cache = args.cache
+    return session.run()

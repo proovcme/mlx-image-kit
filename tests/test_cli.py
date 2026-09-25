@@ -8,9 +8,10 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
+import generate
 
 from mlx_image import engine
-from mlx_image.cli import History, InteractiveSession, _batch_parser, batch_main, parse_batch_jobs
+from mlx_image.cli import History, InteractiveSession, _batch_parser, batch_main, main, parse_batch_jobs
 from mlx_image.engine import Job, Result, Summary, run_jobs
 
 PROMPT = "A red ceramic teapot on a wooden table"
@@ -114,8 +115,96 @@ class HistoryTests(unittest.TestCase):
             history.ensure([result])
             self.assertEqual(len(history.read()), 1)
 
+    def test_old_history_without_cache_field_remains_off(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            history = History(root / ".history" / "history.jsonl")
+            history.append(self._result(root))
+            record = history.read()[0]
+            record.pop("cache")
+            history.path.write_text(json.dumps(record) + "\n")
+            observed = []
+
+            def runner(jobs, **kwargs):
+                observed.extend(jobs)
+                return Summary(1)
+
+            session = InteractiveSession(history=history, output_dir=root, runner=runner)
+            with contextlib.redirect_stdout(io.StringIO()):
+                session.handle("/cache experimental")
+                session.handle("/repeat")
+            self.assertEqual(observed[0].cache_mode, "off")
+
 
 class InteractiveTests(unittest.TestCase):
+    def test_cache_command_status_history_and_repeat(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            observed = []
+
+            def runner(jobs, *, model_path=None, on_complete=None, cache_config=None):
+                observed.append((jobs[0], cache_config))
+                result = Result(jobs[0], "2026-09-24T12:00:00+03:00", 1.0, 4.2)
+                if on_complete:
+                    on_complete(result)
+                return Summary(1, completed=[result], elapsed_seconds=1.0)
+
+            session = InteractiveSession(history=History(root / ".history" / "history.jsonl"),
+                                         output_dir=root / "outputs", runner=runner)
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                session.handle("/cache experimental")
+                session.handle("/status")
+                session.handle(PROMPT)
+                session.handle("/cache off")
+                session.handle("/repeat")
+            self.assertEqual([job.cache_mode for job, _ in observed], ["experimental", "experimental"])
+            self.assertEqual([config.threshold for _, config in observed], [0.08, 0.08])
+            self.assertEqual([record["cache"] for record in session.history.read()], ["experimental", "experimental"])
+            self.assertIn("cache      experimental", output.getvalue())
+            self.assertNotIn(PROMPT, output.getvalue())
+
+    def test_direct_and_batch_cache_argument(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "prompts.txt"
+            source.write_text(PROMPT + "\n")
+            args = _batch_parser().parse_args([str(source), "--cache", "experimental"])
+            jobs, failures = parse_batch_jobs(args)
+            self.assertFalse(failures)
+            self.assertEqual(jobs[0].cache_mode, "experimental")
+            started = []
+            with patch("mlx_image.cli.InteractiveSession.run", autospec=True,
+                       side_effect=lambda session: started.append(session.settings.cache) or 0) as run:
+                self.assertEqual(main(["--cache", "experimental"]), 0)
+                self.assertEqual(len(run.call_args.args), 1)
+            self.assertEqual(started, ["experimental"])
+
+            observed = []
+
+            def runner(batch_jobs, *, model_path=None, on_complete=None, cache_config=None):
+                observed.append((batch_jobs, cache_config))
+                return Summary(len(batch_jobs))
+
+            with patch("mlx_image.cli._run_jobs", side_effect=runner), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(batch_main([str(source), "--cache", "experimental"]), 0)
+            self.assertEqual(observed[0][0][0].cache_mode, "experimental")
+            self.assertEqual(observed[0][1].threshold, 0.08)
+
+            direct = []
+
+            def direct_runner(direct_jobs, *, model_path=None, cache_config=None):
+                direct.append((direct_jobs[0], cache_config))
+                return Summary(1, completed=[Result(direct_jobs[0], "2026-09-24T12:00:00+03:00", 1.0, 4.2)])
+
+            with (
+                patch("sys.argv", ["generate.py", "--prompt", PROMPT, "--cache", "experimental"]),
+                patch("mlx_image.engine.run_jobs", side_effect=direct_runner),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(generate.main(), 0)
+            self.assertEqual(direct[0][0].cache_mode, "experimental")
+            self.assertEqual(direct[0][1].threshold, 0.08)
+
     def test_paste_preserves_full_multiline_prompt_until_end(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -21,4 +21,4 @@ mlx-image = "mlx_image.cli:main"
 
 [tool.setuptools]
 py-modules = ["generate"]
-packages = ["mlx_image"]
+packages = ["mlx_image", "mlx_image.cache"]

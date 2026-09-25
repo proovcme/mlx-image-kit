@@ -31,6 +31,7 @@ from mflux.models.qwen21.model.qwen21_vae.qwen21_vae import Qwen21VAE
 from mflux.models.qwen21.qwen21_initializer import Qwen21Initializer
 from mflux.models.qwen21.variants.txt2img.qwen_image_21 import QwenImage21
 from mflux.utils.image_util import ImageUtil
+from mlx_image.cache import CacheConfig, NoiseCache, relative_l1
 from mlx_image.types import Failure, Job, Result, Summary, validate_job
 
 MODEL_ID = "mlx-community/Qwen-Image-2.1-MLX-4bit"
@@ -156,7 +157,16 @@ def _load_vae(snapshot: Path):
     return vae
 
 
-def _denoise(job: Job, tr, embeds, mask, model_config: ModelConfig, on_step: Callable[[int, int], None] | None = None):
+def _denoise(
+    job: Job,
+    tr,
+    embeds,
+    mask,
+    model_config: ModelConfig,
+    on_step: Callable[[int, int], None] | None = None,
+    on_diagnostic: Callable[[dict], None] | None = None,
+    cache_config: CacheConfig | None = None,
+):
     config = Config(
         width=job.width,
         height=job.height,
@@ -179,15 +189,67 @@ def _denoise(job: Job, tr, embeds, mask, model_config: ModelConfig, on_step: Cal
         ),
     ).astype(ModelConfig.precision)
     mx.eval(latents)
+    if cache_config is None and on_diagnostic is None:
+        # Keep the v0.3.0 loop intact when cache and diagnostics are off.
+        for step, t in enumerate(config.time_steps, 1):
+            latents_scaled = config.scheduler.scale_model_input(latents, t)
+            noise = tr(
+                t=t,
+                config=config,
+                hidden_states=latents_scaled,
+                encoder_hidden_states=embeds,
+                encoder_hidden_states_mask=mask,
+            )
+            latents = config.scheduler.step(noise=noise, timestep=t, latents=latents)
+            mx.eval(latents)
+            if on_step:
+                on_step(step, job.steps)
+        return latents
+
+    cache = NoiseCache(cache_config) if cache_config is not None else None
+    previous_input = None
+    previous_noise = None
     for step, t in enumerate(config.time_steps, 1):
         latents_scaled = config.scheduler.scale_model_input(latents, t)
-        noise = tr(
-            t=t,
-            config=config,
-            hidden_states=latents_scaled,
-            encoder_hidden_states=embeds,
-            encoder_hidden_states_mask=mask,
-        )
+        metric = None
+        if cache is not None:
+            reuse, metric = cache.decide(step=step, total=job.steps, current_input=latents_scaled)
+        else:
+            reuse = False
+            if previous_input is not None:
+                metric = relative_l1(latents_scaled, previous_input)
+        began_forward = time.monotonic() if on_diagnostic is not None else None
+        if reuse:
+            noise = cache.noise
+            output_metric = None
+            forward_seconds = 0.0
+        else:
+            noise = tr(
+                t=t,
+                config=config,
+                hidden_states=latents_scaled,
+                encoder_hidden_states=embeds,
+                encoder_hidden_states_mask=mask,
+            )
+            mx.eval(noise)
+            forward_seconds = time.monotonic() - began_forward if began_forward is not None else None
+            if cache is not None:
+                output_metric = cache.observe_forward(latents_scaled, noise)
+            else:
+                output_metric = relative_l1(noise, previous_noise) if previous_noise is not None else None
+        if on_diagnostic is not None:
+            on_diagnostic({
+                "step": step,
+                "timestep": int(t),
+                "metric": metric,
+                "output_metric": output_metric,
+                "threshold": cache_config.threshold if cache_config is not None else None,
+                "forward": not reuse,
+                "forward_seconds": forward_seconds,
+                "reuse": reuse,
+            })
+            previous_input = latents_scaled
+            previous_noise = noise
         latents = config.scheduler.step(noise=noise, timestep=t, latents=latents)
         mx.eval(latents)
         if on_step:
@@ -211,6 +273,9 @@ def run_jobs(
     model_path: Path | None = None,
     on_complete: Callable[[Result], None] | None = None,
     on_failure: Callable[[Failure], None] | None = None,
+    on_denoise_diagnostic: Callable[[int, dict], None] | None = None,
+    on_stage_timing: Callable[[int, str, float], None] | None = None,
+    cache_config: CacheConfig | None = None,
     progress: bool = True,
 ) -> Summary:
     """Run sequential jobs with one load of each heavy model and disk-spilled intermediates."""
@@ -267,6 +332,8 @@ def run_jobs(
                             text_encoder=te,
                         )
                         mx.eval(embeds, mask)
+                        if on_stage_timing:
+                            on_stage_timing(state.job.index, "prompt_encoding", time.monotonic() - began)
                         mx.savez(str(state.embeds_path), embeds=embeds, mask=mask)
                         state.compute_seconds += time.monotonic() - began
                         if progress:
@@ -311,7 +378,18 @@ def run_jobs(
                             elif step == total:
                                 print(line)
 
-                        latents = _denoise(state.job, tr, data["embeds"], data["mask"], model_config, show_step if progress else None)
+                        began_denoise = time.monotonic()
+                        if on_denoise_diagnostic is None and cache_config is None:
+                            latents = _denoise(state.job, tr, data["embeds"], data["mask"], model_config, show_step if progress else None)
+                        else:
+                            latents = _denoise(
+                                state.job, tr, data["embeds"], data["mask"], model_config,
+                                show_step if progress else None,
+                                (lambda record: on_denoise_diagnostic(state.job.index, record)) if on_denoise_diagnostic else None,
+                                cache_config,
+                            )
+                        if on_stage_timing:
+                            on_stage_timing(state.job.index, "denoising", time.monotonic() - began_denoise)
                         mx.savez(str(state.latents_path), latents=latents)
                         state.compute_seconds += time.monotonic() - began
                     except Exception as exc:
@@ -346,8 +424,11 @@ def run_jobs(
                         unpacked = Qwen21LatentCreator.unpack_latents(
                             latents=data["latents"], height=state.job.height, width=state.job.width
                         )
+                        began_decode = time.monotonic()
                         decoded = VAEUtil.decode(vae=vae, latent=unpacked, tiling_config=None)
                         mx.eval(decoded)
+                        if on_stage_timing:
+                            on_stage_timing(state.job.index, "vae_decode", time.monotonic() - began_decode)
                         _save_png(decoded, state.job.output)
                         state.compute_seconds += time.monotonic() - began
                         result = Result(

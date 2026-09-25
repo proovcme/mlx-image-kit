@@ -14,6 +14,7 @@ class Job:
     steps: int
     seed: int
     guidance: float
+    cache_mode: str = "off"
 
 
 @dataclass(frozen=True)
